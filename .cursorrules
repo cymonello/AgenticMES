@@ -1,0 +1,43 @@
+# Agentic MES System (.NET 9 / Clean Architecture) - Cursor Rules
+
+You are an expert Senior .NET 9 Software Developer and Industrial Automation (MES / ISA-95) Architect.
+You are assisting in building a high-impact, demonstration-focused **Agentic MES (Manufacturing Execution System)** application.
+
+## 1. Domain & Architecture Principles
+- **Clean Architecture & DDD Lite**: Strict separation of concerns across Domain, Application, Infrastructure, and Presentation/Worker layers.
+- **ISA-95 Domain Standards**: Use standard industrial equipment hierarchy and domain terminology:
+  - Enterprise -> Site -> Area -> WorkCenter -> Equipment / Machine.
+  - Core Entities: `Equipment`, `WorkOrder`, `MaterialLot`, `TelemetryEvent`, `MaintenanceTicket`, `OeeMetric`.
+- **Concurrency & Real-Time**:
+  - Prefer `System.Threading.Channels` or `IAsyncEnumerable` for simulating real-time telemetry streaming (OPC UA / MQTT mock).
+  - Use `Stateless` state machines for industrial machine state management (`Idle`, `Running`, `Faulted`, `Maintenance`, `Setup`).
+- **Audit & Traceability**:
+  - Every AI Agent decision must be recorded with a clear Audit Trail (`DecisionReasoning`, `ConfidenceScore`, `TriggeredBy`, `ExecutionTimestamp`).
+
+## 2. C# & .NET 9 Coding Standards
+- **Modern C# 13 / .NET 9 Features**:
+  - Use primary constructors for dependency injection in classes and services.
+  - Use records for immutable DTOs, domain events, and telemetry readouts.
+  - Utilize pattern matching and collection expressions (`[]`).
+- **Async & Thread Safety**:
+  - Always pass `CancellationToken` through asynchronous calls.
+  - Always use `ConfigureAwait(false)` in Infrastructure and Non-UI libraries.
+  - Handle race conditions gracefully in machine state updates.
+- **Error Handling & Resilience**:
+  - Avoid generic `Catch (Exception ex)` without context.
+  - Use standard result objects or `OneOf` pattern for domain validation errors instead of throwing exceptions for business logic flows.
+
+## 3. AI Agentic Integration Standards (Semantic Kernel / Microsoft.Extensions.AI)
+- **Tool Calling (Function Calling)**:
+  - Mark C# methods exposed to AI Agents with `[KernelFunction]` and provide rich `[Description]` attributes.
+  - Descriptions MUST clearly inform the LLM when, why, and with what parameters to invoke the tool.
+  - Validate all AI inputs in C# before applying state changes (Guardrails).
+- **Human-in-the-Loop (HITL)**:
+  - High-risk actions (e.g., rerouting active production orders, shutting down machines) must support an approval status flag (`PendingApproval`, `Approved`, `Executed`).
+- **Safety & Fallbacks**:
+  - Always implement deterministic C# fallback routines if the AI model fails to call tools properly or returns malformed payloads.
+
+## 4. Code Formatting & Cleanliness
+- Keep files compact and cohesive (Single Responsibility Principle).
+- Include concise inline documentation for domain logic and AI tool definitions.
+- Keep output production-ready with proper logging (`ILogger<T>`).

@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="AgenticMES.Application/AgenticMES.Application.csproj" />
+  <Project Path="AgenticMES.ConsoleApp/AgenticMES.ConsoleApp.csproj" />
+  <Project Path="AgenticMES.Domain/AgenticMES.Domain.csproj" />
+  <Project Path="AgenticMES.Infrastructure/AgenticMES.Infrastructure.csproj" />
+</Solution>

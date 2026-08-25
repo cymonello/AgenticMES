@@ -418,6 +418,9 @@ FodyWeavers.xsd
 # Local History for Visual Studio Code
 .history/
 
+# Cursor local settings (may contain secrets)
+.cursor/
+
 # Built Visual Studio Code Extensions
 *.vsix
 
