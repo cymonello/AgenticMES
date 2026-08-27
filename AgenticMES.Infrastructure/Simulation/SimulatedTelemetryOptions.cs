@@ -12,7 +12,7 @@ public sealed record SimulatedTelemetryOptions
     public int ChannelCapacity { get; init; } = 256;
 
     /// <summary>
-    /// Equipment identities to simulate. When empty, three demo machines are created at start-up.
+    /// Equipment identities to simulate. When empty, the seeded CNC-01 / CNC-02 / CNC-03 machines are used.
     /// </summary>
     public IReadOnlyList<Guid> EquipmentIds { get; init; } = [];
 }

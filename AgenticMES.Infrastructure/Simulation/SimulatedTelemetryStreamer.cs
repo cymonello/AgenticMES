@@ -2,6 +2,7 @@ using System.Threading.Channels;
 using AgenticMES.Application.Common.Interfaces;
 using AgenticMES.Domain.Enums;
 using AgenticMES.Domain.Events;
+using AgenticMES.Infrastructure.Persistence;
 using Microsoft.Extensions.Logging;
 
 namespace AgenticMES.Infrastructure.Simulation;
@@ -160,7 +161,7 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
     {
         var ids = equipmentIds.Count > 0
             ? equipmentIds
-            : [Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()];
+            : DemoPlantCatalog.MachineIds;
 
         return [.. ids.Select(id => new MachineSimState(id))];
     }
