@@ -28,6 +28,11 @@ public sealed class WorkOrder(
 
     public decimal ProducedQuantity { get; private set; }
 
+    /// <summary>Quantity still to produce on this operations request.</summary>
+    public decimal RemainingQuantity => PlannedQuantity > ProducedQuantity
+        ? PlannedQuantity - ProducedQuantity
+        : 0m;
+
     public DateTimeOffset DueAt { get; } = dueAt;
 
     public int Priority { get; private set; } = priority;

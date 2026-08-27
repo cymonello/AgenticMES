@@ -112,6 +112,16 @@ public sealed class Equipment(
         return DomainResult.Success();
     }
 
+    /// <summary>
+    /// Drops the current operations request without changing industrial state.
+    /// Used when rerouting a work order off a Faulted or Idle machine.
+    /// </summary>
+    public DomainResult ClearWorkOrderAssignment()
+    {
+        CurrentWorkOrderId = null;
+        return DomainResult.Success();
+    }
+
     public DomainResult TryTransitionTo(EquipmentState target)
     {
         if (!CanTransitionTo(target))
