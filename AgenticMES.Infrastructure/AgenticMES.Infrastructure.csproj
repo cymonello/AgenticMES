@@ -6,7 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.6" />
-    <PackageReference Include="Microsoft.SemanticKernel" Version="1.79.0" />
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.80.0" />
     <PackageReference Include="Stateless" Version="5.20.1" />
   </ItemGroup>
 
