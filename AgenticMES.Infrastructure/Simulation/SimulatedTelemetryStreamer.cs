@@ -11,12 +11,13 @@ namespace AgenticMES.Infrastructure.Simulation;
 /// In-process OPC UA / MQTT mock that emits temperature, produced-item count, and scrap-rate
 /// tags for each simulated machine once per second via a bounded <see cref="Channel{T}"/>.
 /// </summary>
-public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
+public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetrySimulationController
 {
     private readonly ILogger<SimulatedTelemetryStreamer> _logger;
     private readonly SimulatedTelemetryOptions _options;
     private readonly Channel<TelemetryEvent> _channel;
     private readonly MachineSimState[] _machines;
+    private readonly object _gate = new();
     private readonly Random _random = Random.Shared;
 
     public SimulatedTelemetryStreamer(
@@ -40,6 +41,43 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
     }
 
     public ChannelReader<TelemetryEvent> Reader => _channel.Reader;
+
+    /// <inheritdoc />
+    public bool HasActiveAnomaly { get; private set; }
+
+    /// <inheritdoc />
+    public Guid? AnomalousEquipmentId { get; private set; }
+
+    /// <inheritdoc />
+    public void InjectThermalAnomaly(
+        Guid equipmentId,
+        double peakTemperatureCelsius,
+        double peakScrapRatePercent)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(peakTemperatureCelsius, 0d);
+        ArgumentOutOfRangeException.ThrowIfLessThan(peakScrapRatePercent, 0d);
+
+        lock (_gate)
+        {
+            var machine = Array.Find(_machines, candidate => candidate.EquipmentId == equipmentId);
+            if (machine is null)
+            {
+                throw new InvalidOperationException($"No simulated machine is registered for {equipmentId}.");
+            }
+
+            machine.Anomaly = new ThermalAnomaly(peakTemperatureCelsius, peakScrapRatePercent);
+            machine.Temperature = peakTemperatureCelsius;
+            machine.ScrapRate = Math.Max(machine.ScrapRate, Math.Min(12.0, peakScrapRatePercent * 0.45));
+            HasActiveAnomaly = true;
+            AnomalousEquipmentId = equipmentId;
+        }
+
+        _logger.LogWarning(
+            "Thermal anomaly injected on {EquipmentId}: peak {Temperature} °C, scrap climbing toward {ScrapRate}%.",
+            equipmentId,
+            peakTemperatureCelsius,
+            peakScrapRatePercent);
+    }
 
     /// <inheritdoc />
     public async Task RunAsync(CancellationToken cancellationToken = default)
@@ -77,13 +115,22 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
 
         foreach (var machine in _machines)
         {
-            Advance(machine);
+            double temperature;
+            double producedItems;
+            double scrapRate;
+            lock (_gate)
+            {
+                Advance(machine);
+                temperature = machine.Temperature;
+                producedItems = machine.ProducedItems;
+                scrapRate = machine.ScrapRate;
+            }
 
             await WriteTagAsync(
                     machine,
                     timestamp,
                     TelemetryTags.Temperature,
-                    machine.Temperature,
+                    temperature,
                     TelemetryTags.TemperatureUnit,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -92,7 +139,7 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
                     machine,
                     timestamp,
                     TelemetryTags.ProducedItems,
-                    machine.ProducedItems,
+                    producedItems,
                     TelemetryTags.ProducedItemsUnit,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -101,7 +148,7 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
                     machine,
                     timestamp,
                     TelemetryTags.ScrapRate,
-                    machine.ScrapRate,
+                    scrapRate,
                     TelemetryTags.ScrapRateUnit,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -139,6 +186,12 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
 
     private void Advance(MachineSimState machine)
     {
+        if (machine.Anomaly is { } anomaly)
+        {
+            AdvanceAnomaly(machine, anomaly);
+            return;
+        }
+
         // Random-walk process temperature around a typical CNC coolant/spindle band.
         machine.Temperature = Math.Clamp(
             machine.Temperature + NextDelta(1.6),
@@ -153,6 +206,23 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
             machine.ScrapRate + NextDelta(0.35),
             min: 0.2,
             max: 8.0);
+    }
+
+    private void AdvanceAnomaly(MachineSimState machine, ThermalAnomaly anomaly)
+    {
+        machine.Temperature = Math.Clamp(
+            anomaly.PeakTemperatureCelsius + NextDelta(3.5),
+            min: anomaly.PeakTemperatureCelsius - 4.0,
+            max: anomaly.PeakTemperatureCelsius + 8.0);
+
+        // Quality collapse: scrap climbs each cycle toward the injected peak.
+        machine.ScrapRate = Math.Clamp(
+            machine.ScrapRate + 2.2 + NextDelta(0.45),
+            min: machine.ScrapRate,
+            max: anomaly.PeakScrapRatePercent);
+
+        // Throughput drops while the spindle overheats.
+        machine.ProducedItems += _random.Next(0, 2);
     }
 
     private double NextDelta(double amplitude) => (_random.NextDouble() - 0.5) * 2.0 * amplitude;
@@ -177,5 +247,9 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer
         public double ProducedItems { get; set; }
 
         public double ScrapRate { get; set; } = 1.8;
+
+        public ThermalAnomaly? Anomaly { get; set; }
     }
+
+    private sealed record ThermalAnomaly(double PeakTemperatureCelsius, double PeakScrapRatePercent);
 }
