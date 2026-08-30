@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Text;
 using AgenticMES.Application.Common.Interfaces;
+using AgenticMES.Application.CQRS;
+using AgenticMES.Application.CQRS.Commands;
 using AgenticMES.Application.DTOs;
 using AgenticMES.Domain.Entities;
 using AgenticMES.Domain.Enums;
@@ -24,6 +26,9 @@ public sealed class IncidentSimulationWorkflow(
     ITelemetryStreamer telemetryStreamer,
     ITelemetrySimulationController simulationController,
     Func<MesAgentOrchestrator> orchestratorFactory,
+    IHitlApprovalService hitlApprovalService,
+    ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult> machineStateHandler,
+    ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult> rerouteHandler,
     DemoLogCapture logCapture,
     DailyFileLoggerProvider fileLogger)
 {
@@ -383,10 +388,212 @@ public sealed class IncidentSimulationWorkflow(
         AnsiConsole.MarkupLine("[grey]Agent logs (Semantic Kernel + MES tools) appear below while the model works.[/]\n");
 
         var report = await InvokeAgentWithLiveLogsAsync(orchestrator, anomalyContext, cancellationToken);
+        
+        await ProcessPendingApprovalsAsync(cancellationToken);
+        
         var reportPath = await PersistReportAsync(report, cancellationToken);
         RenderIncidentReport(report, reportPath, fileLogger.CurrentFilePath);
 
+        await RenderFinalShopFloorStateAsync(cancellationToken);
+        
         await WaitUntilEnterAsync("Press [bold]Enter[/] to finish the demo", cancellationToken);
+    }
+
+    private async Task ProcessPendingApprovalsAsync(CancellationToken cancellationToken)
+    {
+        var pending = hitlApprovalService.GetPendingRequests();
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold yellow]HUMAN-IN-THE-LOOP APPROVAL REQUIRED[/]").RuleStyle("yellow").Centered());
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[grey]The AI agent requested {pending.Count} high-risk action(s) that require operator approval.[/]\n");
+
+        foreach (var request in pending)
+        {
+            RenderApprovalRequest(request);
+            var approved = await PromptForApprovalAsync(cancellationToken);
+
+            if (approved)
+            {
+                hitlApprovalService.Approve(request.RequestId);
+                await ExecuteApprovedActionAsync(request, cancellationToken);
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[red]Action REJECTED by operator.[/]\n");
+            }
+        }
+
+        hitlApprovalService.Clear();
+    }
+
+    private static void RenderApprovalRequest(PendingApprovalRequest request)
+    {
+        var grid = new Grid().AddColumn().AddColumn();
+        grid.AddRow("[bold]Action type[/]", Markup.Escape(request.ActionType.ToString()));
+        grid.AddRow("[bold]Description[/]", Markup.Escape(request.Description));
+        grid.AddRow("[bold]Reason[/]", Markup.Escape(request.Reason));
+        grid.AddRow("[bold]AI confidence[/]", $"{request.ConfidenceScore:P0}");
+        grid.AddRow("[bold]AI reasoning[/]", Markup.Escape(request.DecisionReasoning));
+
+        AnsiConsole.Write(new Panel(grid)
+            .Header(" Pending High-Risk Action ")
+            .BorderColor(Color.Yellow)
+            .Padding(1, 0));
+        AnsiConsole.WriteLine();
+    }
+
+    private static async Task<bool> PromptForApprovalAsync(CancellationToken cancellationToken)
+    {
+        AnsiConsole.MarkupLine("[bold yellow]Approve this action? Type 'Y' to approve, any other key to reject:[/]");
+
+        DrainBufferedKeys();
+
+        if (!CanReadKeys())
+        {
+            await Task.Delay(400, cancellationToken);
+            return false;
+        }
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (TryReadKey(out var key))
+            {
+                var approved = key is ConsoleKey.Y;
+                AnsiConsole.MarkupLine(approved
+                    ? "[green]✓ APPROVED[/]\n"
+                    : "[red]✗ REJECTED[/]\n");
+                return approved;
+            }
+
+            await Task.Delay(50, cancellationToken);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return false;
+    }
+
+    private async Task ExecuteApprovedActionAsync(PendingApprovalRequest request, CancellationToken cancellationToken)
+    {
+        try
+        {
+            switch (request.ActionType)
+            {
+                case ActionType.SetMachineState:
+                    var stateCommand = (ChangeMachineStateCommand)request.CommandData;
+                    var approvedStateCommand = stateCommand with { ApprovalStatus = ApprovalStatus.Approved };
+                    var stateResult = await machineStateHandler.HandleAsync(approvedStateCommand, cancellationToken);
+
+                    if (stateResult.IsSuccess)
+                    {
+                        AnsiConsole.MarkupLine($"[green]✓ Executed: {Markup.Escape(request.Description)}[/]");
+                        AnsiConsole.MarkupLine($"[grey]Result: {Markup.Escape(stateResult.NewState?.ToString() ?? "Unknown")} at {stateResult.ExecutionTimestamp:HH:mm:ss} UTC[/]\n");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine($"[red]✗ Failed: {Markup.Escape(stateResult.Error ?? "Unknown error")}[/]\n");
+                    }
+                    break;
+
+                case ActionType.RerouteWorkOrder:
+                    var rerouteCommand = (RerouteWorkOrderCommand)request.CommandData;
+                    var approvedRerouteCommand = rerouteCommand with { ApprovalStatus = ApprovalStatus.Approved };
+                    var rerouteResult = await rerouteHandler.HandleAsync(approvedRerouteCommand, cancellationToken);
+
+                    if (rerouteResult.IsSuccess)
+                    {
+                        AnsiConsole.MarkupLine($"[green]✓ Executed: {Markup.Escape(request.Description)}[/]");
+                        AnsiConsole.MarkupLine($"[grey]Result: {rerouteResult.RemainingQuantity} units rerouted at {rerouteResult.ExecutionTimestamp:HH:mm:ss} UTC[/]\n");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine($"[red]✗ Failed: {Markup.Escape(rerouteResult.Error ?? "Unknown error")}[/]\n");
+                    }
+                    break;
+
+                default:
+                    AnsiConsole.MarkupLine($"[red]Unknown action type: {request.ActionType}[/]\n");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Exception during execution: {Markup.Escape(ex.Message)}[/]\n");
+        }
+    }
+
+    private async Task RenderFinalShopFloorStateAsync(CancellationToken cancellationToken)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold aqua]FINAL SHOP FLOOR STATE[/]").RuleStyle("aqua").Centered());
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Machine states and work order assignments after AI agent actions:[/]\n");
+
+        var rows = SnapshotMachines();
+        var table = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Aqua)
+            .AddColumn(new TableColumn("[bold]Machine[/]").NoWrap())
+            .AddColumn(new TableColumn("[bold]State[/]").Centered().NoWrap())
+            .AddColumn(new TableColumn("[bold]Work Order[/]").NoWrap())
+            .AddColumn(new TableColumn("[bold]A[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]P[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Q[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]OEE[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Temp[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Coolant[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Scrap[/]").RightAligned().NoWrap());
+
+        foreach (var row in rows)
+        {
+            var code = row.IsAnomalous ? $"[bold yellow]{row.Code}[/]" : $"[bold]{row.Code}[/]";
+            table.AddRow(
+                code,
+                StateBadge(row.State),
+                row.WorkOrder,
+                FactorMarkup(row.AvailabilityPercent),
+                FactorMarkup(row.PerformancePercent),
+                FactorMarkup(row.QualityPercent, invertLowOnAnomaly: row.IsAnomalous),
+                OeeMarkup(row.OeePercent),
+                TemperatureMarkup(row.Temperature, row.IsAnomalous),
+                CoolantMarkup(row.CoolantPressure, row.IsAnomalous),
+                ScrapMarkup(row.ScrapRate, row.IsAnomalous));
+        }
+
+        AnsiConsole.Write(table);
+        AnsiConsole.WriteLine();
+
+        var changes = new List<string>();
+        foreach (var row in rows)
+        {
+            var equipment = await equipmentRepository.GetByCodeAsync(row.Code, cancellationToken);
+            if (equipment is null)
+            {
+                continue;
+            }
+
+            var timeSinceChange = DateTimeOffset.UtcNow - equipment.StateChangedAt;
+            if (timeSinceChange.TotalMinutes < 2)
+            {
+                changes.Add($"[aqua]•[/] {row.Code}: {Markup.Escape(equipment.State.ToString())} (changed {timeSinceChange.TotalSeconds:0}s ago)");
+            }
+        }
+
+        if (changes.Count > 0)
+        {
+            AnsiConsole.MarkupLine("[grey]Recent state changes:[/]");
+            foreach (var change in changes)
+            {
+                AnsiConsole.MarkupLine(change);
+            }
+            AnsiConsole.WriteLine();
+        }
+
+        AnsiConsole.MarkupLine("[grey]Talking point:[/] Final shop floor state shows the results of AI agent decisions and operator approvals.\n");
     }
 
     private async Task<AnomalyContext?> BuildAnomalyContextAsync(CancellationToken cancellationToken)
@@ -921,6 +1128,30 @@ public sealed class IncidentSimulationWorkflow(
             }
 
             return Console.ReadKey(intercept: true).Key == ConsoleKey.Enter;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadKey(out ConsoleKey key)
+    {
+        key = default;
+        try
+        {
+            if (!Console.KeyAvailable)
+            {
+                return false;
+            }
+
+            var keyInfo = Console.ReadKey(intercept: true);
+            key = keyInfo.Key;
+            return true;
         }
         catch (InvalidOperationException)
         {

@@ -9,6 +9,7 @@ namespace AgenticMES.Application.CQRS.Commands;
 public sealed class ChangeMachineStateCommandHandler(
     IEquipmentRepository equipmentRepository,
     IWorkOrderRepository workOrderRepository,
+    IHitlApprovalService hitlApprovalService,
     ILogger<ChangeMachineStateCommandHandler> logger)
     : ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>
 {
@@ -45,6 +46,17 @@ public sealed class ChangeMachineStateCommandHandler(
                 command.TargetState,
                 command.Reason,
                 command.TriggeredBy);
+
+            var description = $"Set {equipment.EquipmentCode} state: {equipment.State} → {command.TargetState}";
+            hitlApprovalService.RegisterPendingAction(new PendingApprovalRequest(
+                RequestId: Guid.NewGuid(),
+                ActionType: ActionType.SetMachineState,
+                Description: description,
+                Reason: command.Reason,
+                DecisionReasoning: command.DecisionReasoning ?? "Not provided",
+                ConfidenceScore: command.ConfidenceScore ?? 0m,
+                RequestedAt: DateTimeOffset.UtcNow,
+                CommandData: command));
 
             return ChangeMachineStateResult.Pending(
                 equipment.EquipmentCode,

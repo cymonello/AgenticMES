@@ -6,6 +6,7 @@ using AgenticMES.Application.Services;
 using AgenticMES.ConsoleApp;
 using AgenticMES.Infrastructure.Ai;
 using AgenticMES.Infrastructure.Persistence;
+using AgenticMES.Infrastructure.Services;
 using AgenticMES.Infrastructure.Simulation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -56,6 +57,7 @@ builder.Services.AddSingleton<SimulatedTelemetryStreamer>();
 builder.Services.AddSingleton<ITelemetryStreamer>(sp => sp.GetRequiredService<SimulatedTelemetryStreamer>());
 builder.Services.AddSingleton<ITelemetrySimulationController>(sp => sp.GetRequiredService<SimulatedTelemetryStreamer>());
 
+builder.Services.AddSingleton<IHitlApprovalService, DemoHitlApprovalService>();
 builder.Services.AddSingleton<ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>, ChangeMachineStateCommandHandler>();
 builder.Services.AddSingleton<ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult>, RerouteWorkOrderCommandHandler>();
 builder.Services.AddSingleton<MachineControlTools>();
