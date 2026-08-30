@@ -18,15 +18,18 @@ var builder = Host.CreateApplicationBuilder(args);
 var logCapture = new DemoLogCapture();
 builder.Services.AddSingleton(logCapture);
 
+var fileLogger = new DailyFileLoggerProvider();
+builder.Services.AddSingleton(fileLogger);
+
 builder.Logging.ClearProviders();
 builder.Logging.AddProvider(logCapture);
-builder.Logging.SetMinimumLevel(LogLevel.Debug);
-builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
-builder.Logging.AddFilter("System", LogLevel.Warning);
-builder.Logging.AddFilter("AgenticMES", LogLevel.Warning);
-builder.Logging.AddFilter("AgenticMES.Infrastructure.Ai", LogLevel.Information);
-builder.Logging.AddFilter("AgenticMES.Application.AiTools", LogLevel.Information);
-builder.Logging.AddFilter("Microsoft.SemanticKernel", LogLevel.Debug);
+builder.Logging.AddProvider(fileLogger);
+
+// Factory floor must be Trace so the file sink can see everything. Category rules below
+// are scoped to DemoLogCapture only — they must not apply to DailyFileLoggerProvider.
+builder.Logging.SetMinimumLevel(LogLevel.Trace);
+builder.Logging.AddFilter<DailyFileLoggerProvider>((_, level) => level != LogLevel.None);
+builder.Logging.AddFilter<DemoLogCapture>(ShouldCaptureInDemoUi);
 
 builder.Services.AddSingleton(_ => DemoPlantCatalog.Create());
 
@@ -126,4 +129,26 @@ static string? FirstNonEmpty(params string?[] values)
     }
 
     return null;
+}
+
+static bool ShouldCaptureInDemoUi(string? category, LogLevel level)
+{
+    category ??= string.Empty;
+
+    if (category.StartsWith("Microsoft.SemanticKernel", StringComparison.Ordinal))
+    {
+        return level >= LogLevel.Debug;
+    }
+
+    if (category.StartsWith("AgenticMES.Infrastructure.Ai", StringComparison.Ordinal))
+    {
+        return level >= LogLevel.Information;
+    }
+
+    if (category.StartsWith("AgenticMES.Application.AiTools", StringComparison.Ordinal))
+    {
+        return level >= LogLevel.Information;
+    }
+
+    return level >= LogLevel.Warning;
 }

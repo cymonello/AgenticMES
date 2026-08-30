@@ -24,7 +24,8 @@ public sealed class IncidentSimulationWorkflow(
     ITelemetryStreamer telemetryStreamer,
     ITelemetrySimulationController simulationController,
     Func<MesAgentOrchestrator> orchestratorFactory,
-    DemoLogCapture logCapture)
+    DemoLogCapture logCapture,
+    DailyFileLoggerProvider fileLogger)
 {
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromMilliseconds(250);
     private const int LiveViewHeight = 13;
@@ -383,7 +384,7 @@ public sealed class IncidentSimulationWorkflow(
 
         var report = await InvokeAgentWithLiveLogsAsync(orchestrator, anomalyContext, cancellationToken);
         var reportPath = await PersistReportAsync(report, cancellationToken);
-        RenderIncidentReport(report, reportPath);
+        RenderIncidentReport(report, reportPath, fileLogger.CurrentFilePath);
 
         await WaitUntilEnterAsync("Press [bold]Enter[/] to finish the demo", cancellationToken);
     }
@@ -616,7 +617,7 @@ public sealed class IncidentSimulationWorkflow(
         return builder.ToString();
     }
 
-    private static void RenderIncidentReport(IncidentResponseReport report, string reportPath)
+    private static void RenderIncidentReport(IncidentResponseReport report, string reportPath, string logFilePath)
     {
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Rule("[bold]Incident response report[/]").RuleStyle(report.Success ? "green" : "red").Centered());
@@ -671,7 +672,8 @@ public sealed class IncidentSimulationWorkflow(
         }
 
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine($"[bold gold1]Report file:[/] {Markup.Escape(reportPath)}\n");
+        AnsiConsole.MarkupLine($"[bold gold1]Report file:[/] {Markup.Escape(reportPath)}");
+        AnsiConsole.MarkupLine($"[bold gold1]Log file:[/] {Markup.Escape(logFilePath)}\n");
     }
 
     private async Task ConsumeTelemetryAsync(CancellationToken cancellationToken)
