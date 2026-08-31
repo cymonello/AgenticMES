@@ -152,7 +152,7 @@ static bool ShouldCaptureInDemoUi(string? category, LogLevel level)
         return level >= LogLevel.Information;
     }
 
-    if (category.StartsWith("AgenticMES.Application.AiTools", StringComparison.Ordinal))
+    if (category.StartsWith("AgenticMES.Application.Services", StringComparison.Ordinal))
     {
         return level >= LogLevel.Information;
     }
