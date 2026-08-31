@@ -1,68 +1,30 @@
-using System.ComponentModel;
 using AgenticMES.Application.Common.Interfaces;
 using AgenticMES.Application.CQRS;
 using AgenticMES.Application.CQRS.Commands;
 using AgenticMES.Domain.Enums;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
 
-namespace AgenticMES.Application.AiTools;
+namespace AgenticMES.Application.Services;
 
 /// <summary>
-/// Semantic Kernel AI toolset for ISA-95 production scheduling and work order dispatch optimization.
-/// Enables LLM agents to dynamically reroute production and identify alternative manufacturing resources.
+/// Application service for ISA-95 production scheduling and work order dispatch optimization.
+/// Framework-agnostic; can be consumed by AI agents, APIs, or operator interfaces.
 /// </summary>
-public sealed class SchedulingTools(
+public sealed class SchedulingService(
     ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult> rerouteHandler,
     IEquipmentRepository equipmentRepository,
     IWorkOrderRepository workOrderRepository,
-    ILogger<SchedulingTools> logger)
+    ILogger<SchedulingService> logger) : ISchedulingService
 {
-    /// <summary>
-    /// Reroutes an active work order from one equipment to another, enabling dynamic production optimization
-    /// in response to equipment faults, maintenance needs, or capacity constraints.
-    /// This is a high-risk operation that ALWAYS requires human approval before execution.
-    /// </summary>
-    /// <param name="workOrderNumber">Plant-floor operations request identifier (e.g., WO-2024-001234).</param>
-    /// <param name="sourceEquipmentCode">Current equipment code where the work order is assigned (e.g., CNC-03).</param>
-    /// <param name="targetEquipmentCode">Destination equipment code to receive the work order (e.g., CNC-05).</param>
-    /// <param name="reason">Clear operational justification for the reroute (e.g., 'Source machine faulted with spindle error', 'Optimize utilization due to priority change').</param>
-    /// <param name="decisionReasoning">AI agent's internal reasoning chain explaining why this reroute was chosen (e.g., 'Target machine has 40% lower utilization and compatible tooling').</param>
-    /// <param name="confidenceScore">AI confidence level for this decision (0.0 to 1.0). Values below 0.7 should trigger human review.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>
-    /// A result object indicating success/failure, approval status (always PendingApproval initially),
-    /// remaining quantity to produce, already produced quantity, and execution timestamp for audit trail.
-    /// </returns>
-    /// <remarks>
-    /// Use this tool when:
-    /// - Source equipment becomes unavailable (Faulted, entering Maintenance).
-    /// - Production priority changes require shifting work to higher-capacity resources.
-    /// - Load balancing optimization identifies underutilized alternative equipment.
-    /// - Quality issues on source equipment necessitate moving production to verified machines.
-    /// Do NOT use if:
-    /// - Work order is already Completed, Cancelled, or not yet Released.
-    /// - Target equipment is Faulted or in Maintenance.
-    /// - You are uncertain about equipment codes or compatibility.
-    /// Always provide detailed reasoning and an honest confidence score to enable proper human oversight.
-    /// </remarks>
-    [KernelFunction]
-    [Description(
-        "Reroutes an ISA-95 work order from one equipment to another to handle faults, maintenance, or optimize production flow. " +
-        "This is a HIGH-RISK operation that ALWAYS requires human approval. " +
-        "Stops the work order on the source equipment and dispatches remaining quantity to the target equipment. " +
-        "Use when source equipment fails, enters maintenance, or when load balancing requires shifting production. " +
-        "Always provide clear operational reasoning and an honest AI confidence score (0.0-1.0) for audit compliance.")]
     public async Task<string> RerouteWorkOrderAsync(
-        [Description("Work order number (e.g., WO-2024-001234)")] string workOrderNumber,
-        [Description("Current equipment code where work order is assigned (e.g., CNC-03)")] string sourceEquipmentCode,
-        [Description("Destination equipment code to receive the work order (e.g., CNC-05)")] string targetEquipmentCode,
-        [Description("Clear operational reason for the reroute (e.g., 'Source machine faulted', 'Optimize utilization')")] string reason,
-        [Description("AI agent's internal reasoning explaining why this reroute was chosen")] string decisionReasoning,
-        [Description("AI confidence level (0.0 to 1.0). Values < 0.7 should trigger review.")] decimal confidenceScore,
+        string workOrderNumber,
+        string sourceEquipmentCode,
+        string targetEquipmentCode,
+        string reason,
+        string decisionReasoning,
+        decimal confidenceScore,
         CancellationToken cancellationToken = default)
     {
-        // Input validation (Guardrails)
         if (string.IsNullOrWhiteSpace(workOrderNumber))
         {
             return "Error: workOrderNumber is required and cannot be empty.";
@@ -98,7 +60,6 @@ public sealed class SchedulingTools(
             return "Error: sourceEquipmentCode and targetEquipmentCode must be different.";
         }
 
-        // Resolve entities
         var workOrder = await workOrderRepository
             .GetByNumberAsync(workOrderNumber.Trim(), cancellationToken)
             .ConfigureAwait(false);
@@ -126,7 +87,6 @@ public sealed class SchedulingTools(
             return $"Error: Target equipment with code '{targetEquipmentCode}' was not found in the system.";
         }
 
-        // Execute command
         var command = new RerouteWorkOrderCommand(
             WorkOrderId: workOrder.Id,
             SourceEquipmentId: sourceEquipment.Id,
@@ -142,7 +102,7 @@ public sealed class SchedulingTools(
             .ConfigureAwait(false);
 
         logger.LogInformation(
-            "AI RerouteWorkOrder: WorkOrder={WorkOrderNumber}, Source={SourceCode}, Target={TargetCode}, " +
+            "RerouteWorkOrder: WorkOrder={WorkOrderNumber}, Source={SourceCode}, Target={TargetCode}, " +
             "Status={ApprovalStatus}, Confidence={Confidence}, Success={IsSuccess}",
             workOrderNumber,
             sourceEquipmentCode,
@@ -174,44 +134,15 @@ public sealed class SchedulingTools(
         };
     }
 
-    /// <summary>
-    /// Identifies equipment that can serve as alternative production resources for work order rerouting.
-    /// Filters for equipment that is operationally available (Idle or Running without conflicts),
-    /// at the same hierarchical level, and physically located in the same area or work center.
-    /// </summary>
-    /// <param name="equipmentCode">Reference equipment code to find alternatives for (e.g., CNC-03).</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>
-    /// A formatted list of alternative equipment codes with their current operational state,
-    /// work order assignment status, and hierarchical location.
-    /// </returns>
-    /// <remarks>
-    /// Use this tool when:
-    /// - Planning a work order reroute and need to identify suitable target equipment.
-    /// - Equipment faults or maintenance events require finding backup machines.
-    /// - Performing capacity planning or load balancing analysis.
-    /// - Investigating production flexibility and redundancy options.
-    /// This is a read-only, low-risk operation that does not require approval.
-    /// The tool prioritizes Idle equipment (no active work orders) over Running equipment
-    /// and excludes Faulted or Maintenance equipment entirely.
-    /// </remarks>
-    [KernelFunction]
-    [Description(
-        "Identifies alternative ISA-95 equipment suitable for work order rerouting. " +
-        "Returns a list of equipment at the same hierarchical level and location that are operationally available (Idle or Running without conflicts). " +
-        "Excludes Faulted or Maintenance equipment. " +
-        "Use this to plan reroutes, analyze production capacity, or find backup machines when equipment becomes unavailable.")]
     public async Task<string> GetAvailableAlternativeMachinesAsync(
-        [Description("Reference equipment code to find alternatives for (e.g., CNC-03)")] string equipmentCode,
+        string equipmentCode,
         CancellationToken cancellationToken = default)
     {
-        // Input validation (Guardrails)
         if (string.IsNullOrWhiteSpace(equipmentCode))
         {
             return "Error: equipmentCode is required and cannot be empty.";
         }
 
-        // Resolve reference equipment
         var referenceEquipment = await equipmentRepository
             .GetByCodeAsync(equipmentCode.Trim(), cancellationToken)
             .ConfigureAwait(false);
@@ -221,23 +152,17 @@ public sealed class SchedulingTools(
             return $"Error: Equipment with code '{equipmentCode}' was not found in the system.";
         }
 
-        // Get all equipment in the system
         var allEquipment = await equipmentRepository
             .ListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // Filter for alternatives:
-        // 1. Same hierarchical level (e.g., both are Equipment-level machines, not WorkCenters)
-        // 2. Same parent (same work center or area)
-        // 3. Not the reference equipment itself
-        // 4. Operationally available (not Faulted or in Maintenance)
         var alternatives = allEquipment
             .Where(e =>
                 e.Id != referenceEquipment.Id &&
                 e.Level == referenceEquipment.Level &&
                 e.ParentEquipmentId == referenceEquipment.ParentEquipmentId &&
                 e.State is not (EquipmentState.Faulted or EquipmentState.Maintenance))
-            .OrderBy(e => e.State == EquipmentState.Idle ? 0 : 1) // Idle machines first
+            .OrderBy(e => e.State == EquipmentState.Idle ? 0 : 1)
             .ThenBy(e => e.EquipmentCode)
             .ToList();
 
@@ -264,7 +189,7 @@ public sealed class SchedulingTools(
         report += $"\nTotal alternatives found: {alternatives.Count}";
 
         logger.LogInformation(
-            "AI GetAvailableAlternativeMachines: Reference={EquipmentCode}, AlternativesFound={Count}",
+            "GetAvailableAlternativeMachines: Reference={EquipmentCode}, AlternativesFound={Count}",
             equipmentCode,
             alternatives.Count);
 
