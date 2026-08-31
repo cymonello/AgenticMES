@@ -13,4 +13,5 @@ public sealed record TelemetryEvent(
     double Value,
     string? EngineeringUnit = null,
     TelemetryQuality Quality = TelemetryQuality.Good,
-    EquipmentState? ReportedState = null);
+    EquipmentState? ReportedState = null,
+    string? EquipmentCode = null);

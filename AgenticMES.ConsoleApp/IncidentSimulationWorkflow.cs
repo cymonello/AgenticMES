@@ -1,9 +1,13 @@
 using System.Collections.Concurrent;
+using System.Text;
 using AgenticMES.Application.Common.Interfaces;
+using AgenticMES.Application.CQRS;
+using AgenticMES.Application.CQRS.Commands;
 using AgenticMES.Application.DTOs;
 using AgenticMES.Domain.Entities;
 using AgenticMES.Domain.Enums;
 using AgenticMES.Domain.Events;
+using AgenticMES.Infrastructure.Ai;
 using AgenticMES.Infrastructure.Persistence;
 using AgenticMES.Infrastructure.Simulation;
 using Spectre.Console;
@@ -20,15 +24,23 @@ public sealed class IncidentSimulationWorkflow(
     IWorkOrderRepository workOrderRepository,
     IOeeCalculatorService oeeCalculator,
     ITelemetryStreamer telemetryStreamer,
-    ITelemetrySimulationController simulationController)
+    ITelemetrySimulationController simulationController,
+    Func<MesAgentOrchestrator> orchestratorFactory,
+    IHitlApprovalService hitlApprovalService,
+    ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult> machineStateHandler,
+    ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult> rerouteHandler,
+    DemoLogCapture logCapture,
+    DailyFileLoggerProvider fileLogger)
 {
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromMilliseconds(250);
     private const int LiveViewHeight = 13;
+    private const int AiLogViewHeight = 14;
 
     private readonly DateTimeOffset _shiftStartedAt = DateTimeOffset.UtcNow.AddMinutes(-35);
     private readonly ConcurrentDictionary<Guid, MachineTelemetry> _telemetry = new();
     private readonly ConcurrentQueue<string> _eventLog = new();
     private readonly Dictionary<Guid, double> _lastProducedTelemetry = [];
+    private readonly TelemetryIncidentCapture _incidentCapture = new();
     private readonly object _sync = new();
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
@@ -143,7 +155,7 @@ public sealed class IncidentSimulationWorkflow(
             refreshWhileWaiting);
 
         startStreaming();
-        EnqueueEvent("[bold aqua]OPC UA mock online[/]  Temperature / ProducedItems / ScrapRate @ 400 ms");
+        EnqueueEvent("[bold aqua]OPC UA mock online[/]  Temp / Scrap / Coolant / Vibration / SpindleLoad @ 400 ms");
 
         await HoldStepAsync(
             DemoPhase.Streaming,
@@ -157,7 +169,7 @@ public sealed class IncidentSimulationWorkflow(
             DemoPlantCatalog.Cnc01Id,
             peakTemperatureCelsius: 128.0,
             peakScrapRatePercent: 24.0);
-        EnqueueEvent("[bold red]ANOMALY[/]  CNC-01 spindle temperature jumped to 128 °C — scrap climbing");
+        EnqueueEvent("[bold red]INJECT[/]  thermal disturbance on CNC-01 — waiting for OPC UA tags to cross alarm");
 
         await HoldStepAsync(
             DemoPhase.Anomaly,
@@ -224,7 +236,8 @@ public sealed class IncidentSimulationWorkflow(
             "[bold]Interview vertical slice[/]  — press [bold]Enter[/] after each beat\n" +
             "[grey]1.[/] Live machine state + ISO 22400 OEE board\n" +
             "[grey]2.[/] Normal telemetry stream (OPC UA / MQTT mock)\n" +
-            "[grey]3.[/] Thermal runaway on CNC-01 with scrap-rate growth\n\n" +
+            "[grey]3.[/] Thermal runaway on CNC-01 with scrap-rate growth\n" +
+            "[grey]4.[/] AI agent diagnoses the incident and writes an audit report\n\n" +
             "[grey]Ctrl+C aborts.[/]");
 
         AnsiConsole.Write(new Columns(
@@ -267,6 +280,7 @@ public sealed class IncidentSimulationWorkflow(
             .AddColumn(new TableColumn("[bold]Q[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[bold]OEE[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[bold]Temp[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Coolant[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[bold]Scrap[/]").RightAligned().NoWrap());
 
         foreach (var row in rows)
@@ -281,15 +295,9 @@ public sealed class IncidentSimulationWorkflow(
                 FactorMarkup(row.QualityPercent, invertLowOnAnomaly: row.IsAnomalous),
                 OeeMarkup(row.OeePercent),
                 TemperatureMarkup(row.Temperature, row.IsAnomalous),
+                CoolantMarkup(row.CoolantPressure, row.IsAnomalous),
                 ScrapMarkup(row.ScrapRate, row.IsAnomalous));
         }
-
-        var context = phase switch
-        {
-            DemoPhase.FloorBoard => "[grey]Talking point:[/] ISA-95 states + OEE = A × P × Q. CNC-01 running WO-1001 · CNC-02 idle · CNC-03 faulted.",
-            DemoPhase.Streaming => "[grey]Talking point:[/] mock OPC UA tags at 400 ms feed produced qty into live OEE.",
-            _ => "[grey]Talking point:[/] quality OEE collapsing — next beat is HITL maintenance + reroute WO-1001."
-        };
 
         var events = _eventLog.ToArray();
         var latest = events.Length == 0
@@ -299,7 +307,6 @@ public sealed class IncidentSimulationWorkflow(
         return new FixedHeightRenderable(
             new Rows(
                 table,
-                new Markup(context),
                 new Markup(latest),
                 new Markup($"[bold aqua]▸ {Markup.Escape(prompt)}[/]")),
             height: LiveViewHeight);
@@ -308,27 +315,562 @@ public sealed class IncidentSimulationWorkflow(
     private async Task RenderEpilogueAsync(CancellationToken cancellationToken)
     {
         var rows = SnapshotMachines();
-        var victim = rows.FirstOrDefault(r => r.Code == "CNC-01");
+        _incidentCapture.TryDescribe(simulationController.AnomalousEquipmentId, out var captured);
+        var victim = rows.FirstOrDefault(r => r.Code == captured?.EquipmentCode)
+                     ?? rows.FirstOrDefault(r => r.IsAnomalous)
+                     ?? rows.FirstOrDefault(r => r.Code == "CNC-01");
 
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Rule("[bold red]Incident closed — summary[/]").RuleStyle("red").Centered());
         AnsiConsole.WriteLine();
 
         var grid = new Grid().AddColumn().AddColumn();
-        grid.AddRow("[bold]Asset[/]", "CNC-01  Haas ST-20Y CNC Lathe");
-        grid.AddRow("[bold]Trigger[/]", "Sudden temperature jump + scrap-rate growth");
-        grid.AddRow("[bold]Peak temperature[/]", victim?.Temperature is { } t ? $"[red]{t:0.0} °C[/]" : "[grey]n/a[/]");
-        grid.AddRow("[bold]Scrap rate[/]", victim?.ScrapRate is { } s ? $"[red]{s:0.0} %[/]" : "[grey]n/a[/]");
+        grid.AddRow("[bold]Asset[/]", victim is null ? "[grey]n/a[/]" : $"{Markup.Escape(victim.Code)}  {Markup.Escape(victim.Name)}");
+        grid.AddRow("[bold]Trigger[/]", captured is null
+            ? "[grey]no alarm crossed in the captured window[/]"
+            : Markup.Escape($"{captured.PrimarySymptom} first seen {captured.DetectedAt:HH:mm:ss} UTC"));
+        grid.AddRow("[bold]Peak temperature[/]", FormatPeak(captured?.PeakTemperature ?? victim?.Temperature, "°C", alert: true));
+        grid.AddRow("[bold]Peak scrap rate[/]", FormatPeak(captured?.PeakScrapRate ?? victim?.ScrapRate, "%", alert: true));
+        grid.AddRow("[bold]Coolant pressure[/]", FormatPeak(captured?.LatestCoolantPressure ?? victim?.CoolantPressure, "PSI", alert: (captured?.LatestCoolantPressure ?? victim?.CoolantPressure) < TelemetryIncidentCapture.CoolantLowPsi));
+        grid.AddRow("[bold]Peak vibration[/]", FormatPeak(captured?.PeakVibration, "in/s", alert: captured?.PeakVibration >= TelemetryIncidentCapture.VibrationAlarmInPerSec));
         grid.AddRow("[bold]OEE after incident[/]", victim?.OeePercent is { } oee ? OeeMarkup(oee) : "[grey]n/a[/]");
         grid.AddRow("[bold]Quality factor[/]", victim?.QualityPercent is { } q ? FactorMarkup(q, invertLowOnAnomaly: true) : "[grey]n/a[/]");
 
         AnsiConsole.Write(new Panel(grid)
-            .Header(" CNC-01 thermal runaway ")
+            .Header($" {captured?.EquipmentCode ?? victim?.Code ?? "Incident"} from telemetry window ")
             .BorderColor(Color.Red)
             .Padding(1, 0));
 
-        AnsiConsole.MarkupLine("\n[grey]Talking point:[/] Agentic HITL would propose maintenance and reroute WO-1001 off CNC-01.\n");
+        AnsiConsole.WriteLine();
+        await WaitUntilEnterAsync("Press [bold]Enter[/] to dispatch the AI agent", cancellationToken);
+        await RunAiIncidentResponseAsync(cancellationToken);
+    }
+
+    private async Task RunAiIncidentResponseAsync(CancellationToken cancellationToken)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold gold1]STEP 4/4  AI INCIDENT RESPONSE[/]").RuleStyle("gold1").Centered());
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Building AnomalyContext from the captured OPC UA window, then invoking ProcessAnomalyAsync.[/]\n");
+
+        MesAgentOrchestrator orchestrator;
+        try
+        {
+            orchestrator = orchestratorFactory();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            var message = ex.InnerException?.Message ?? ex.Message;
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(message)}[/]");
+            AnsiConsole.MarkupLine("[grey]Shop-floor demo finished without the AI step.[/]\n");
+            await WaitUntilEnterAsync("Press [bold]Enter[/] to finish the demo", cancellationToken);
+            return;
+        }
+
+        var anomalyContext = await BuildAnomalyContextAsync(cancellationToken);
+        if (anomalyContext is null)
+        {
+            AnsiConsole.MarkupLine("[red]No telemetry window was captured. Start the OPC UA stream before dispatching the AI agent.[/]\n");
+            await WaitUntilEnterAsync("Press [bold]Enter[/] to finish the demo", cancellationToken);
+            return;
+        }
+
+        RenderAnomalyContext(anomalyContext);
+
+        AnsiConsole.MarkupLine("[grey]Agent logs (Semantic Kernel + MES tools) appear below while the model works.[/]\n");
+
+        var report = await InvokeAgentWithLiveLogsAsync(orchestrator, anomalyContext, cancellationToken);
+        
+        await ProcessPendingApprovalsAsync(cancellationToken);
+        
+        var reportPath = await PersistReportAsync(report, cancellationToken);
+        RenderIncidentReport(report, reportPath, fileLogger.CurrentFilePath);
+
+        await RenderFinalShopFloorStateAsync(cancellationToken);
+        
         await WaitUntilEnterAsync("Press [bold]Enter[/] to finish the demo", cancellationToken);
+    }
+
+    private async Task ProcessPendingApprovalsAsync(CancellationToken cancellationToken)
+    {
+        var pending = hitlApprovalService.GetPendingRequests();
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold yellow]HUMAN-IN-THE-LOOP APPROVAL REQUIRED[/]").RuleStyle("yellow").Centered());
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[grey]The AI agent requested {pending.Count} high-risk action(s) that require operator approval.[/]\n");
+
+        foreach (var request in pending)
+        {
+            RenderApprovalRequest(request);
+            var approved = await PromptForApprovalAsync(cancellationToken);
+
+            if (approved)
+            {
+                hitlApprovalService.Approve(request.RequestId);
+                await ExecuteApprovedActionAsync(request, cancellationToken);
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[red]Action REJECTED by operator.[/]\n");
+            }
+        }
+
+        hitlApprovalService.Clear();
+    }
+
+    private static void RenderApprovalRequest(PendingApprovalRequest request)
+    {
+        var grid = new Grid().AddColumn().AddColumn();
+        grid.AddRow("[bold]Action type[/]", Markup.Escape(request.ActionType.ToString()));
+        grid.AddRow("[bold]Description[/]", Markup.Escape(request.Description));
+        grid.AddRow("[bold]Reason[/]", Markup.Escape(request.Reason));
+        grid.AddRow("[bold]AI confidence[/]", $"{request.ConfidenceScore:P0}");
+        grid.AddRow("[bold]AI reasoning[/]", Markup.Escape(request.DecisionReasoning));
+
+        AnsiConsole.Write(new Panel(grid)
+            .Header(" Pending High-Risk Action ")
+            .BorderColor(Color.Yellow)
+            .Padding(1, 0));
+        AnsiConsole.WriteLine();
+    }
+
+    private static async Task<bool> PromptForApprovalAsync(CancellationToken cancellationToken)
+    {
+        AnsiConsole.MarkupLine("[bold yellow]Approve this action? Type 'Y' to approve, any other key to reject:[/]");
+
+        DrainBufferedKeys();
+
+        if (!CanReadKeys())
+        {
+            await Task.Delay(400, cancellationToken);
+            return false;
+        }
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (TryReadKey(out var key))
+            {
+                var approved = key is ConsoleKey.Y;
+                AnsiConsole.MarkupLine(approved
+                    ? "[green]✓ APPROVED[/]\n"
+                    : "[red]✗ REJECTED[/]\n");
+                return approved;
+            }
+
+            await Task.Delay(50, cancellationToken);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return false;
+    }
+
+    private async Task ExecuteApprovedActionAsync(PendingApprovalRequest request, CancellationToken cancellationToken)
+    {
+        try
+        {
+            switch (request.ActionType)
+            {
+                case ActionType.SetMachineState:
+                    var stateCommand = (ChangeMachineStateCommand)request.CommandData;
+                    var approvedStateCommand = stateCommand with { ApprovalStatus = ApprovalStatus.Approved };
+                    var stateResult = await machineStateHandler.HandleAsync(approvedStateCommand, cancellationToken);
+
+                    if (stateResult.IsSuccess)
+                    {
+                        AnsiConsole.MarkupLine($"[green]✓ Executed: {Markup.Escape(request.Description)}[/]");
+                        AnsiConsole.MarkupLine($"[grey]Result: {Markup.Escape(stateResult.NewState?.ToString() ?? "Unknown")} at {stateResult.ExecutionTimestamp:HH:mm:ss} UTC[/]\n");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine($"[red]✗ Failed: {Markup.Escape(stateResult.Error ?? "Unknown error")}[/]\n");
+                    }
+                    break;
+
+                case ActionType.RerouteWorkOrder:
+                    var rerouteCommand = (RerouteWorkOrderCommand)request.CommandData;
+                    var approvedRerouteCommand = rerouteCommand with { ApprovalStatus = ApprovalStatus.Approved };
+                    var rerouteResult = await rerouteHandler.HandleAsync(approvedRerouteCommand, cancellationToken);
+
+                    if (rerouteResult.IsSuccess)
+                    {
+                        AnsiConsole.MarkupLine($"[green]✓ Executed: {Markup.Escape(request.Description)}[/]");
+                        AnsiConsole.MarkupLine($"[grey]Result: {rerouteResult.RemainingQuantity} units rerouted at {rerouteResult.ExecutionTimestamp:HH:mm:ss} UTC[/]\n");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine($"[red]✗ Failed: {Markup.Escape(rerouteResult.Error ?? "Unknown error")}[/]\n");
+                    }
+                    break;
+
+                default:
+                    AnsiConsole.MarkupLine($"[red]Unknown action type: {request.ActionType}[/]\n");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Exception during execution: {Markup.Escape(ex.Message)}[/]\n");
+        }
+    }
+
+    private async Task RenderFinalShopFloorStateAsync(CancellationToken cancellationToken)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold aqua]FINAL SHOP FLOOR STATE[/]").RuleStyle("aqua").Centered());
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Machine states and work order assignments after AI agent actions:[/]\n");
+
+        var rows = SnapshotMachines();
+        var table = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Aqua)
+            .AddColumn(new TableColumn("[bold]Machine[/]").NoWrap())
+            .AddColumn(new TableColumn("[bold]State[/]").Centered().NoWrap())
+            .AddColumn(new TableColumn("[bold]Work Order[/]").NoWrap())
+            .AddColumn(new TableColumn("[bold]A[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]P[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Q[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]OEE[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Temp[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Coolant[/]").RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]Scrap[/]").RightAligned().NoWrap());
+
+        foreach (var row in rows)
+        {
+            var code = row.IsAnomalous ? $"[bold yellow]{row.Code}[/]" : $"[bold]{row.Code}[/]";
+            table.AddRow(
+                code,
+                StateBadge(row.State),
+                row.WorkOrder,
+                FactorMarkup(row.AvailabilityPercent),
+                FactorMarkup(row.PerformancePercent),
+                FactorMarkup(row.QualityPercent, invertLowOnAnomaly: row.IsAnomalous),
+                OeeMarkup(row.OeePercent),
+                TemperatureMarkup(row.Temperature, row.IsAnomalous),
+                CoolantMarkup(row.CoolantPressure, row.IsAnomalous),
+                ScrapMarkup(row.ScrapRate, row.IsAnomalous));
+        }
+
+        AnsiConsole.Write(table);
+        AnsiConsole.WriteLine();
+
+        var changes = new List<string>();
+        foreach (var row in rows)
+        {
+            var equipment = await equipmentRepository.GetByCodeAsync(row.Code, cancellationToken);
+            if (equipment is null)
+            {
+                continue;
+            }
+
+            var timeSinceChange = DateTimeOffset.UtcNow - equipment.StateChangedAt;
+            if (timeSinceChange.TotalMinutes < 2)
+            {
+                changes.Add($"[aqua]•[/] {row.Code}: {Markup.Escape(equipment.State.ToString())} (changed {timeSinceChange.TotalSeconds:0}s ago)");
+            }
+        }
+
+        if (changes.Count > 0)
+        {
+            AnsiConsole.MarkupLine("[grey]Recent state changes:[/]");
+            foreach (var change in changes)
+            {
+                AnsiConsole.MarkupLine(change);
+            }
+            AnsiConsole.WriteLine();
+        }
+    }
+
+    private async Task<AnomalyContext?> BuildAnomalyContextAsync(CancellationToken cancellationToken)
+    {
+        if (!_incidentCapture.TryDescribe(simulationController.AnomalousEquipmentId, out var captured) || captured is null)
+        {
+            return null;
+        }
+
+        var plantContext = await BuildPlantContextAsync(captured.EquipmentCode, cancellationToken);
+        return new AnomalyContext(
+            EquipmentCode: captured.EquipmentCode,
+            PrimarySymptom: captured.PrimarySymptom,
+            TelemetrySummary: captured.TelemetrySummary,
+            DetectedAt: captured.DetectedAt,
+            AdditionalContext: plantContext);
+    }
+
+    private async Task<string> BuildPlantContextAsync(string equipmentCode, CancellationToken cancellationToken)
+    {
+        var equipment = await equipmentRepository.GetByCodeAsync(equipmentCode, cancellationToken);
+        if (equipment is null)
+        {
+            return $"Equipment {equipmentCode} is not in the live MES model.";
+        }
+
+        var assigned = await workOrderRepository.ListByAssignedEquipmentAsync(equipment.Id, cancellationToken);
+        var workOrder = assigned.FirstOrDefault(w => w.Status is WorkOrderStatus.InProgress or WorkOrderStatus.Held);
+        var workOrderLine = workOrder is null
+            ? "none"
+            : $"{workOrder.WorkOrderNumber} {workOrder.ProductCode} {workOrder.ProducedQuantity:0}/{workOrder.PlannedQuantity:0} ({workOrder.Status})";
+
+        var siblings = equipment.ParentEquipmentId is { } parentId
+            ? await equipmentRepository.ListByParentAsync(parentId, cancellationToken)
+            : [];
+        var alternatives = siblings
+            .Where(s => s.Id != equipment.Id)
+            .OrderBy(s => s.EquipmentCode, StringComparer.OrdinalIgnoreCase)
+            .Select(s => $"{s.EquipmentCode} ({s.Name}): {s.State}" +
+                         (s.CurrentWorkOrderId is null ? ", no work order" : ", has a work order"))
+            .ToArray();
+
+        var hierarchy =
+            $"{equipment.Hierarchy.EnterpriseId ?? "n/a"} > {equipment.Hierarchy.SiteId ?? "n/a"} > " +
+            $"{equipment.Hierarchy.AreaId ?? "n/a"} > {equipment.Hierarchy.WorkCenterId ?? "n/a"}";
+
+        return $"""
+            Equipment: {equipment.EquipmentCode} ({equipment.Name})
+            Hierarchy: {hierarchy}
+            MES state: {equipment.State} since {equipment.StateChangedAt:HH:mm:ss} UTC
+            Active work order: {workOrderLine}
+            Cell mates: {(alternatives.Length == 0 ? "none" : string.Join("; ", alternatives))}
+            """;
+    }
+
+    private static void RenderAnomalyContext(AnomalyContext context)
+    {
+        var grid = new Grid().AddColumn().AddColumn();
+        grid.AddRow("[bold]Equipment[/]", Markup.Escape(context.EquipmentCode));
+        grid.AddRow("[bold]Symptom[/]", Markup.Escape(context.PrimarySymptom));
+        grid.AddRow("[bold]Detected at[/]", $"{context.DetectedAt:yyyy-MM-dd HH:mm:ss} UTC");
+
+        AnsiConsole.Write(new Panel(grid)
+            .Header(" AnomalyContext (from telemetry window) ")
+            .BorderColor(Color.Gold1)
+            .Padding(1, 0));
+
+        if (!string.IsNullOrWhiteSpace(context.TelemetrySummary))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Panel(new Markup(Markup.Escape(context.TelemetrySummary)))
+                .Header(" Captured tag window ")
+                .BorderColor(Color.Grey)
+                .Padding(1, 0)
+                .Expand());
+        }
+        AnsiConsole.WriteLine();
+    }
+
+    private async Task<IncidentResponseReport> InvokeAgentWithLiveLogsAsync(
+        MesAgentOrchestrator orchestrator,
+        AnomalyContext anomalyContext,
+        CancellationToken cancellationToken)
+    {
+        logCapture.BeginCapture();
+        var logLines = new List<string>();
+
+        try
+        {
+            var reportTask = orchestrator.ProcessAnomalyAsync(anomalyContext, cancellationToken);
+
+            if (CanUseLiveDisplay())
+            {
+                await AnsiConsole.Live(BuildAiProgressView(logLines, isComplete: false))
+                    .AutoClear(false)
+                    .Overflow(VerticalOverflow.Ellipsis)
+                    .StartAsync(async ctx =>
+                    {
+                        while (!reportTask.IsCompleted)
+                        {
+                            DrainCapturedLogs(logLines);
+                            ctx.UpdateTarget(BuildAiProgressView(logLines, isComplete: false));
+                            await Task.Delay(RefreshInterval, cancellationToken);
+                        }
+
+                        DrainCapturedLogs(logLines);
+                        ctx.UpdateTarget(BuildAiProgressView(logLines, isComplete: true));
+                    });
+            }
+            else
+            {
+                while (!reportTask.IsCompleted)
+                {
+                    while (logCapture.TryDequeue(out var line))
+                    {
+                        logLines.Add(line);
+                        AnsiConsole.MarkupLine($"[grey]{Markup.Escape(line)}[/]");
+                    }
+
+                    await Task.Delay(RefreshInterval, cancellationToken);
+                }
+
+                while (logCapture.TryDequeue(out var trailing))
+                {
+                    logLines.Add(trailing);
+                    AnsiConsole.MarkupLine($"[grey]{Markup.Escape(trailing)}[/]");
+                }
+            }
+
+            return await reportTask;
+        }
+        finally
+        {
+            logCapture.EndCapture();
+        }
+    }
+
+    private void DrainCapturedLogs(List<string> logLines)
+    {
+        while (logCapture.TryDequeue(out var line))
+        {
+            logLines.Add(line);
+        }
+    }
+
+    private static IRenderable BuildAiProgressView(IReadOnlyList<string> logLines, bool isComplete)
+    {
+        var header = isComplete
+            ? "[bold green]AI agent finished[/]"
+            : "[bold gold1]AI agent working — Semantic Kernel + MES tools[/]";
+
+        var recent = logLines.Count == 0
+            ? ["[grey]Waiting for agent logs…[/]"]
+            : logLines.TakeLast(10).Select(line => $"[grey]{Markup.Escape(line)}[/]").ToArray();
+
+        var body = new Markup(string.Join('\n', recent));
+        var panel = new Panel(body)
+            .Header($" {header} ")
+            .BorderColor(isComplete ? Color.Green : Color.Gold1)
+            .Padding(1, 0)
+            .Expand();
+
+        return new FixedHeightRenderable(panel, AiLogViewHeight);
+    }
+
+    private static async Task<string> PersistReportAsync(
+        IncidentResponseReport report,
+        CancellationToken cancellationToken)
+    {
+        var directory = Path.Combine(Directory.GetCurrentDirectory(), "reports");
+        Directory.CreateDirectory(directory);
+
+        var path = Path.Combine(directory, $"incident-{report.EquipmentCode}-{report.IncidentId:N}.md");
+        await File.WriteAllTextAsync(path, FormatReportMarkdown(report), cancellationToken);
+        return path;
+    }
+
+    private static string FormatReportMarkdown(IncidentResponseReport report)
+    {
+        var actions = report.ExecutedActions.Length == 0
+            ? "- (none)"
+            : string.Join('\n', report.ExecutedActions.Select(a => $"- {a}"));
+        var followUp = report.RecommendedFollowUp.Length == 0
+            ? "- (none)"
+            : string.Join('\n', report.RecommendedFollowUp.Select(a => $"- {a}"));
+
+        var builder = new StringBuilder();
+        builder.AppendLine("# MES Incident Response Report");
+        builder.AppendLine();
+        builder.AppendLine($"- **Incident ID:** `{report.IncidentId}`");
+        builder.AppendLine($"- **Equipment:** {report.EquipmentCode}");
+        builder.AppendLine($"- **Symptom:** {report.PrimarySymptom}");
+        builder.AppendLine($"- **Model:** {report.ModelUsed}");
+        builder.AppendLine($"- **Success:** {report.Success}");
+        builder.AppendLine($"- **Started:** {report.ProcessingStartedAt:O}");
+        builder.AppendLine($"- **Completed:** {report.ProcessingCompletedAt:O}");
+        builder.AppendLine($"- **Elapsed:** {report.ElapsedMilliseconds:0} ms");
+        if (!string.IsNullOrWhiteSpace(report.ErrorMessage))
+        {
+            builder.AppendLine($"- **Error:** {report.ErrorMessage}");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("## Telemetry summary");
+        builder.AppendLine();
+        builder.AppendLine("```");
+        builder.AppendLine(report.TelemetrySummary.Trim());
+        builder.AppendLine("```");
+        builder.AppendLine();
+        builder.AppendLine("## Diagnostic knowledge used");
+        builder.AppendLine();
+        builder.AppendLine("```");
+        builder.AppendLine(report.DiagnosticKnowledgeUsed.Trim());
+        builder.AppendLine("```");
+        builder.AppendLine();
+        builder.AppendLine("## AI reasoning");
+        builder.AppendLine();
+        builder.AppendLine(report.AiReasoning.Trim());
+        builder.AppendLine();
+        builder.AppendLine("## Executed actions");
+        builder.AppendLine();
+        builder.AppendLine(actions);
+        builder.AppendLine();
+        builder.AppendLine("## Recommended follow-up");
+        builder.AppendLine();
+        builder.AppendLine(followUp);
+        builder.AppendLine();
+        return builder.ToString();
+    }
+
+    private static void RenderIncidentReport(IncidentResponseReport report, string reportPath, string logFilePath)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[bold]Incident response report[/]").RuleStyle(report.Success ? "green" : "red").Centered());
+        AnsiConsole.WriteLine();
+
+        var status = report.Success ? "[green]Success[/]" : "[red]Failed[/]";
+        var grid = new Grid().AddColumn().AddColumn();
+        grid.AddRow("[bold]Incident ID[/]", Markup.Escape(report.IncidentId.ToString()));
+        grid.AddRow("[bold]Equipment[/]", Markup.Escape(report.EquipmentCode));
+        grid.AddRow("[bold]Symptom[/]", Markup.Escape(report.PrimarySymptom));
+        grid.AddRow("[bold]Status[/]", status);
+        grid.AddRow("[bold]Model[/]", Markup.Escape(report.ModelUsed));
+        grid.AddRow("[bold]Elapsed[/]", $"{report.ElapsedMilliseconds:0} ms");
+        if (!string.IsNullOrWhiteSpace(report.ErrorMessage))
+        {
+            grid.AddRow("[bold]Error[/]", $"[red]{Markup.Escape(report.ErrorMessage)}[/]");
+        }
+
+        AnsiConsole.Write(new Panel(grid)
+            .Header(" Audit trail ")
+            .BorderColor(report.Success ? Color.Green : Color.Red)
+            .Padding(1, 0));
+
+        if (!string.IsNullOrWhiteSpace(report.AiReasoning))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Panel(new Markup(Markup.Escape(report.AiReasoning.Trim())))
+                .Header(" AI reasoning ")
+                .BorderColor(Color.Aqua)
+                .Padding(1, 0)
+                .Expand());
+        }
+
+        if (report.ExecutedActions.Length > 0)
+        {
+            var bullets = string.Join('\n', report.ExecutedActions.Select(action => $"[grey]•[/] {Markup.Escape(action)}"));
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Panel(new Markup(bullets))
+                .Header(" Executed actions ")
+                .BorderColor(Color.Grey)
+                .Padding(1, 0));
+        }
+
+        if (report.RecommendedFollowUp.Length > 0)
+        {
+            var bullets = string.Join('\n', report.RecommendedFollowUp.Select(item => $"[grey]•[/] {Markup.Escape(item)}"));
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Panel(new Markup(bullets))
+                .Header(" Recommended follow-up ")
+                .BorderColor(Color.Grey)
+                .Padding(1, 0));
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[bold gold1]Report file:[/] {Markup.Escape(reportPath)}");
+        AnsiConsole.MarkupLine($"[bold gold1]Log file:[/] {Markup.Escape(logFilePath)}\n");
     }
 
     private async Task ConsumeTelemetryAsync(CancellationToken cancellationToken)
@@ -349,31 +891,31 @@ public sealed class IncidentSimulationWorkflow(
     private async Task ApplyReadoutAsync(TelemetryEvent readout, CancellationToken cancellationToken)
     {
         var snapshot = _telemetry.GetOrAdd(readout.EquipmentId, _ => new MachineTelemetry());
+        snapshot.Apply(readout);
 
-        if (readout.TagName == TelemetryTags.Temperature)
+        if (readout.TagName == TelemetryTags.ProducedItems)
         {
-            snapshot.Temperature = readout.Value;
-        }
-        else if (readout.TagName == TelemetryTags.ScrapRate)
-        {
-            snapshot.ScrapRate = readout.Value;
-        }
-        else if (readout.TagName == TelemetryTags.ProducedItems)
-        {
-            snapshot.ProducedItems = readout.Value;
             await ApplyProductionDeltaAsync(readout.EquipmentId, readout.Value, cancellationToken);
         }
 
-        var code = readout.EquipmentId == DemoPlantCatalog.Cnc01Id ? "CNC-01"
-            : readout.EquipmentId == DemoPlantCatalog.Cnc02Id ? "CNC-02"
-            : readout.EquipmentId == DemoPlantCatalog.Cnc03Id ? "CNC-03"
-            : readout.EquipmentId.ToString("N")[..8];
+        var justDetected = _incidentCapture.Observe(readout);
+        var code = readout.EquipmentCode
+                   ?? (readout.EquipmentId == DemoPlantCatalog.Cnc01Id ? "CNC-01"
+                       : readout.EquipmentId == DemoPlantCatalog.Cnc02Id ? "CNC-02"
+                       : readout.EquipmentId == DemoPlantCatalog.Cnc03Id ? "CNC-03"
+                       : readout.EquipmentId.ToString("N")[..8]);
 
-        var anomaly = simulationController.HasActiveAnomaly
-                      && readout.EquipmentId == simulationController.AnomalousEquipmentId;
-        var tone = anomaly ? "red" : "grey70";
-        EnqueueEvent(
-            $"[{tone}]{readout.Timestamp:HH:mm:ss}[/] {code} {readout.TagName}={readout.Value}");
+        var anomalous = _incidentCapture.AnomalousEquipmentId == readout.EquipmentId;
+        var tone = anomalous ? "red" : "grey70";
+        var quality = readout.Quality is TelemetryQuality.Good ? string.Empty : $" ({readout.Quality})";
+        var unit = string.IsNullOrWhiteSpace(readout.EngineeringUnit) ? string.Empty : $" {Markup.Escape(readout.EngineeringUnit)}";
+        EnqueueEvent($"[{tone}]{readout.Timestamp:HH:mm:ss}[/] {Markup.Escape(code)} {Markup.Escape(readout.TagName)}={readout.Value:0.00}{unit}{Markup.Escape(quality)}");
+
+        if (justDetected)
+        {
+            EnqueueEvent(
+                $"[bold red]DETECTED[/]  {Markup.Escape(code)} {Markup.Escape(readout.TagName)}={readout.Value:0.00}{unit} crossed alarm — capturing window");
+        }
     }
 
     private async Task ApplyProductionDeltaAsync(
@@ -444,8 +986,7 @@ public sealed class IncidentSimulationWorkflow(
                 oee = result.Metric;
             }
 
-            var isAnomalous = simulationController.HasActiveAnomaly
-                              && machine.Id == simulationController.AnomalousEquipmentId;
+            var isAnomalous = machine.Id == _incidentCapture.AnomalousEquipmentId;
 
             rows.Add(new MachineRow(
                 machine.EquipmentCode,
@@ -459,6 +1000,7 @@ public sealed class IncidentSimulationWorkflow(
                 tel?.Temperature,
                 tel?.ProducedItems,
                 tel?.ScrapRate,
+                tel?.CoolantPressure,
                 isAnomalous));
         }
 
@@ -576,6 +1118,30 @@ public sealed class IncidentSimulationWorkflow(
             }
 
             return Console.ReadKey(intercept: true).Key == ConsoleKey.Enter;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadKey(out ConsoleKey key)
+    {
+        key = default;
+        try
+        {
+            if (!Console.KeyAvailable)
+            {
+                return false;
+            }
+
+            var keyInfo = Console.ReadKey(intercept: true);
+            key = keyInfo.Key;
+            return true;
         }
         catch (InvalidOperationException)
         {
@@ -711,11 +1277,36 @@ public sealed class IncidentSimulationWorkflow(
             return "[grey]—[/]";
         }
 
-        var color = anomalous || celsius >= 110 ? "red"
+        var color = anomalous || celsius >= TelemetryIncidentCapture.TemperatureAlarmCelsius ? "red"
             : celsius >= 95 ? "yellow"
             : "green";
 
         return $"[{color}]{celsius.Value:0.0} °C[/]";
+    }
+
+    private static string CoolantMarkup(double? psi, bool anomalous)
+    {
+        if (psi is null)
+        {
+            return "[grey]—[/]";
+        }
+
+        var color = anomalous || psi < TelemetryIncidentCapture.CoolantLowPsi ? "red"
+            : psi < 15 ? "yellow"
+            : "green";
+
+        return $"[{color}]{psi.Value:0.0} PSI[/]";
+    }
+
+    private static string FormatPeak(double? value, string unit, bool alert)
+    {
+        if (value is null)
+        {
+            return "[grey]n/a[/]";
+        }
+
+        var color = alert ? "red" : "green";
+        return $"[{color}]{value.Value:0.0} {unit}[/]";
     }
 
     private static string ScrapMarkup(double? percent, bool anomalous)
@@ -725,7 +1316,7 @@ public sealed class IncidentSimulationWorkflow(
             return "[grey]—[/]";
         }
 
-        var color = anomalous || percent >= 10 ? "red" : percent >= 5 ? "yellow" : "green";
+        var color = anomalous || percent >= TelemetryIncidentCapture.ScrapAlarmPercent ? "red" : percent >= 5 ? "yellow" : "green";
         return $"[{color}]{percent.Value:0.0} %[/]";
     }
 
@@ -777,9 +1368,37 @@ public sealed class IncidentSimulationWorkflow(
 
     private sealed class MachineTelemetry
     {
-        public double Temperature { get; set; }
-        public double ProducedItems { get; set; }
-        public double ScrapRate { get; set; }
+        public double Temperature { get; private set; }
+        public double ProducedItems { get; private set; }
+        public double ScrapRate { get; private set; }
+        public double? CoolantPressure { get; private set; }
+        public double? Vibration { get; private set; }
+        public double? SpindleLoad { get; private set; }
+
+        public void Apply(TelemetryEvent readout)
+        {
+            switch (readout.TagName)
+            {
+                case TelemetryTags.Temperature:
+                    Temperature = readout.Value;
+                    break;
+                case TelemetryTags.ProducedItems:
+                    ProducedItems = readout.Value;
+                    break;
+                case TelemetryTags.ScrapRate:
+                    ScrapRate = readout.Value;
+                    break;
+                case TelemetryTags.CoolantPressure:
+                    CoolantPressure = readout.Value;
+                    break;
+                case TelemetryTags.Vibration:
+                    Vibration = readout.Value;
+                    break;
+                case TelemetryTags.SpindleLoad:
+                    SpindleLoad = readout.Value;
+                    break;
+            }
+        }
     }
 
     private sealed record MachineRow(
@@ -794,5 +1413,6 @@ public sealed class IncidentSimulationWorkflow(
         double? Temperature,
         double? ProducedItems,
         double? ScrapRate,
+        double? CoolantPressure,
         bool IsAnomalous);
 }

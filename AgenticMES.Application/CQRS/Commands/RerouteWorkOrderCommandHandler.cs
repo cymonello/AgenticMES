@@ -8,6 +8,7 @@ namespace AgenticMES.Application.CQRS.Commands;
 public sealed class RerouteWorkOrderCommandHandler(
     IEquipmentRepository equipmentRepository,
     IWorkOrderRepository workOrderRepository,
+    IHitlApprovalService hitlApprovalService,
     ILogger<RerouteWorkOrderCommandHandler> logger)
     : ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult>
 {
@@ -83,6 +84,17 @@ public sealed class RerouteWorkOrderCommandHandler(
                 target.EquipmentCode,
                 command.Reason,
                 command.TriggeredBy);
+
+            var description = $"Reroute {workOrder.WorkOrderNumber}: {source.EquipmentCode} → {target.EquipmentCode} ({workOrder.RemainingQuantity} units)";
+            hitlApprovalService.RegisterPendingAction(new PendingApprovalRequest(
+                RequestId: Guid.NewGuid(),
+                ActionType: ActionType.RerouteWorkOrder,
+                Description: description,
+                Reason: command.Reason,
+                DecisionReasoning: command.DecisionReasoning ?? "Not provided",
+                ConfidenceScore: command.ConfidenceScore ?? 0m,
+                RequestedAt: DateTimeOffset.UtcNow,
+                CommandData: command));
 
             return RerouteWorkOrderResult.Pending(
                 workOrder.WorkOrderNumber,

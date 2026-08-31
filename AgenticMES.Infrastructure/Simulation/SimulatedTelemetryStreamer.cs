@@ -8,8 +8,8 @@ using Microsoft.Extensions.Logging;
 namespace AgenticMES.Infrastructure.Simulation;
 
 /// <summary>
-/// In-process OPC UA / MQTT mock that emits temperature, produced-item count, and scrap-rate
-/// tags for each simulated machine once per second via a bounded <see cref="Channel{T}"/>.
+/// In-process OPC UA / MQTT mock that emits process and quality tags for each simulated
+/// machine via a bounded <see cref="Channel{T}"/>.
 /// </summary>
 public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetrySimulationController
 {
@@ -68,6 +68,9 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetryS
             machine.Anomaly = new ThermalAnomaly(peakTemperatureCelsius, peakScrapRatePercent);
             machine.Temperature = peakTemperatureCelsius;
             machine.ScrapRate = Math.Max(machine.ScrapRate, Math.Min(12.0, peakScrapRatePercent * 0.45));
+            machine.CoolantPressure = Math.Min(machine.CoolantPressure, 9.5);
+            machine.Vibration = Math.Max(machine.Vibration, 0.95);
+            machine.SpindleLoad = Math.Max(machine.SpindleLoad, 78.0);
             HasActiveAnomaly = true;
             AnomalousEquipmentId = equipmentId;
         }
@@ -115,73 +118,78 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetryS
 
         foreach (var machine in _machines)
         {
-            double temperature;
-            double producedItems;
-            double scrapRate;
+            MachineReading reading;
             lock (_gate)
             {
                 Advance(machine);
-                temperature = machine.Temperature;
-                producedItems = machine.ProducedItems;
-                scrapRate = machine.ScrapRate;
+                reading = machine.Capture();
             }
 
-            await WriteTagAsync(
-                    machine,
-                    timestamp,
-                    TelemetryTags.Temperature,
-                    temperature,
-                    TelemetryTags.TemperatureUnit,
-                    cancellationToken)
+            await WriteTagAsync(reading, timestamp, TelemetryTags.Temperature, reading.Temperature, TelemetryTags.TemperatureUnit, cancellationToken)
                 .ConfigureAwait(false);
-
-            await WriteTagAsync(
-                    machine,
-                    timestamp,
-                    TelemetryTags.ProducedItems,
-                    producedItems,
-                    TelemetryTags.ProducedItemsUnit,
-                    cancellationToken)
+            await WriteTagAsync(reading, timestamp, TelemetryTags.ProducedItems, reading.ProducedItems, TelemetryTags.ProducedItemsUnit, cancellationToken)
                 .ConfigureAwait(false);
-
-            await WriteTagAsync(
-                    machine,
-                    timestamp,
-                    TelemetryTags.ScrapRate,
-                    scrapRate,
-                    TelemetryTags.ScrapRateUnit,
-                    cancellationToken)
+            await WriteTagAsync(reading, timestamp, TelemetryTags.ScrapRate, reading.ScrapRate, TelemetryTags.ScrapRateUnit, cancellationToken)
+                .ConfigureAwait(false);
+            await WriteTagAsync(reading, timestamp, TelemetryTags.CoolantPressure, reading.CoolantPressure, TelemetryTags.CoolantPressureUnit, cancellationToken)
+                .ConfigureAwait(false);
+            await WriteTagAsync(reading, timestamp, TelemetryTags.Vibration, reading.Vibration, TelemetryTags.VibrationUnit, cancellationToken)
+                .ConfigureAwait(false);
+            await WriteTagAsync(reading, timestamp, TelemetryTags.SpindleLoad, reading.SpindleLoad, TelemetryTags.SpindleLoadUnit, cancellationToken)
                 .ConfigureAwait(false);
         }
     }
 
     private async Task WriteTagAsync(
-        MachineSimState machine,
+        MachineReading reading,
         DateTimeOffset timestamp,
         string tagName,
         double value,
         string engineeringUnit,
         CancellationToken cancellationToken)
     {
+        var rounded = Math.Round(value, 2, MidpointRounding.AwayFromZero);
         var telemetry = new TelemetryEvent(
             EventId: Guid.NewGuid(),
-            EquipmentId: machine.EquipmentId,
+            EquipmentId: reading.EquipmentId,
             Timestamp: timestamp,
             TagName: tagName,
-            Value: Math.Round(value, 2, MidpointRounding.AwayFromZero),
+            Value: rounded,
             EngineeringUnit: engineeringUnit,
-            Quality: TelemetryQuality.Good,
-            ReportedState: machine.ReportedState);
+            Quality: QualityFor(tagName, rounded, reading.Anomalous),
+            ReportedState: reading.ReportedState,
+            EquipmentCode: reading.EquipmentCode);
 
         await _channel.Writer.WriteAsync(telemetry, cancellationToken).ConfigureAwait(false);
 
         _logger.LogDebug(
-            "{EquipmentId} {TagName}={Value} {Unit} ({State})",
-            machine.EquipmentId,
+            "{EquipmentCode} {TagName}={Value} {Unit} ({State}, {Quality})",
+            reading.EquipmentCode,
             tagName,
             telemetry.Value,
             engineeringUnit,
-            machine.ReportedState);
+            reading.ReportedState,
+            telemetry.Quality);
+    }
+
+    private static TelemetryQuality QualityFor(string tagName, double value, bool anomalous)
+    {
+        if (!anomalous)
+        {
+            return TelemetryQuality.Good;
+        }
+
+        return tagName switch
+        {
+            TelemetryTags.Temperature when value >= 120 => TelemetryQuality.Bad,
+            TelemetryTags.Temperature => TelemetryQuality.Uncertain,
+            TelemetryTags.CoolantPressure when value < 10 => TelemetryQuality.Bad,
+            TelemetryTags.CoolantPressure => TelemetryQuality.Uncertain,
+            TelemetryTags.Vibration when value >= 1.0 => TelemetryQuality.Bad,
+            TelemetryTags.ScrapRate when value >= 15 => TelemetryQuality.Uncertain,
+            TelemetryTags.SpindleLoad when value >= 80 => TelemetryQuality.Uncertain,
+            _ => TelemetryQuality.Good
+        };
     }
 
     private void Advance(MachineSimState machine)
@@ -192,20 +200,12 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetryS
             return;
         }
 
-        // Random-walk process temperature around a typical CNC coolant/spindle band.
-        machine.Temperature = Math.Clamp(
-            machine.Temperature + NextDelta(1.6),
-            min: 45.0,
-            max: 105.0);
-
-        // Cumulative production counter — 1–3 pieces per second while Running.
+        machine.Temperature = Math.Clamp(machine.Temperature + NextDelta(1.6), min: 45.0, max: 105.0);
         machine.ProducedItems += _random.Next(1, 4);
-
-        // Scrap rate (%) wanders in a realistic 0.2–8% quality band.
-        machine.ScrapRate = Math.Clamp(
-            machine.ScrapRate + NextDelta(0.35),
-            min: 0.2,
-            max: 8.0);
+        machine.ScrapRate = Math.Clamp(machine.ScrapRate + NextDelta(0.35), min: 0.2, max: 8.0);
+        machine.CoolantPressure = Math.Clamp(machine.CoolantPressure + NextDelta(0.35), min: 15.0, max: 20.0);
+        machine.Vibration = Math.Clamp(machine.Vibration + NextDelta(0.04), min: 0.12, max: 0.45);
+        machine.SpindleLoad = Math.Clamp(machine.SpindleLoad + NextDelta(2.4), min: 30.0, max: 60.0);
     }
 
     private void AdvanceAnomaly(MachineSimState machine, ThermalAnomaly anomaly)
@@ -215,13 +215,26 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetryS
             min: anomaly.PeakTemperatureCelsius - 4.0,
             max: anomaly.PeakTemperatureCelsius + 8.0);
 
-        // Quality collapse: scrap climbs each cycle toward the injected peak.
         machine.ScrapRate = Math.Clamp(
             machine.ScrapRate + 2.2 + NextDelta(0.45),
             min: machine.ScrapRate,
             max: anomaly.PeakScrapRatePercent);
 
-        // Throughput drops while the spindle overheats.
+        machine.CoolantPressure = Math.Clamp(
+            machine.CoolantPressure - 1.6 + NextDelta(0.35),
+            min: 5.0,
+            max: machine.CoolantPressure);
+
+        machine.Vibration = Math.Clamp(
+            machine.Vibration + 0.12 + NextDelta(0.05),
+            min: machine.Vibration,
+            max: 1.8);
+
+        machine.SpindleLoad = Math.Clamp(
+            machine.SpindleLoad + 3.5 + NextDelta(1.2),
+            min: machine.SpindleLoad,
+            max: 92.0);
+
         machine.ProducedItems += _random.Next(0, 2);
     }
 
@@ -233,12 +246,34 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetryS
             ? equipmentIds
             : DemoPlantCatalog.MachineIds;
 
-        return [.. ids.Select(id => new MachineSimState(id))];
+        return [.. ids.Select(id => new MachineSimState(id, CodeFor(id)))];
     }
 
-    private sealed class MachineSimState(Guid equipmentId)
+    private static string CodeFor(Guid equipmentId)
+    {
+        if (equipmentId == DemoPlantCatalog.Cnc01Id)
+        {
+            return "CNC-01";
+        }
+
+        if (equipmentId == DemoPlantCatalog.Cnc02Id)
+        {
+            return "CNC-02";
+        }
+
+        if (equipmentId == DemoPlantCatalog.Cnc03Id)
+        {
+            return "CNC-03";
+        }
+
+        return equipmentId.ToString("N")[..8];
+    }
+
+    private sealed class MachineSimState(Guid equipmentId, string equipmentCode)
     {
         public Guid EquipmentId { get; } = equipmentId;
+
+        public string EquipmentCode { get; } = equipmentCode;
 
         public EquipmentState ReportedState { get; } = EquipmentState.Running;
 
@@ -248,8 +283,38 @@ public sealed class SimulatedTelemetryStreamer : ITelemetryStreamer, ITelemetryS
 
         public double ScrapRate { get; set; } = 1.8;
 
+        public double CoolantPressure { get; set; } = 18.0;
+
+        public double Vibration { get; set; } = 0.28;
+
+        public double SpindleLoad { get; set; } = 44.0;
+
         public ThermalAnomaly? Anomaly { get; set; }
+
+        public MachineReading Capture() => new(
+            EquipmentId,
+            EquipmentCode,
+            ReportedState,
+            Temperature,
+            ProducedItems,
+            ScrapRate,
+            CoolantPressure,
+            Vibration,
+            SpindleLoad,
+            Anomaly is not null);
     }
+
+    private readonly record struct MachineReading(
+        Guid EquipmentId,
+        string EquipmentCode,
+        EquipmentState ReportedState,
+        double Temperature,
+        double ProducedItems,
+        double ScrapRate,
+        double CoolantPressure,
+        double Vibration,
+        double SpindleLoad,
+        bool Anomalous);
 
     private sealed record ThermalAnomaly(double PeakTemperatureCelsius, double PeakScrapRatePercent);
 }

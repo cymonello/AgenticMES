@@ -3,6 +3,9 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
+# Generated AI incident reports from the console demo
+reports/
+
 # User-specific files
 *.rsuser
 *.suo
