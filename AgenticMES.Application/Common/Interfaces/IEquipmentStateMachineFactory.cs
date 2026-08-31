@@ -5,32 +5,25 @@ using AgenticMES.Domain.Enums;
 namespace AgenticMES.Application.Common.Interfaces;
 
 /// <summary>
-/// Factory for creating Equipment state machines.
-/// Implementation in Infrastructure layer uses Stateless framework.
+/// Creates a Stateless-backed state machine bound to an equipment aggregate.
 /// </summary>
 public interface IEquipmentStateMachineFactory
 {
-    /// <summary>
-    /// Creates a state machine for the given equipment entity.
-    /// </summary>
-    IEquipmentStateMachineWrapper Create(Equipment equipment);
+    IEquipmentStateMachine Create(Equipment equipment);
 }
 
 /// <summary>
-/// Wrapper interface for equipment state machine operations.
-/// Keeps Application layer independent of Stateless framework.
+/// Trigger-based ISA-95 equipment transitions. Application code must not call
+/// <see cref="Equipment.ApplyState"/> directly.
 /// </summary>
-public interface IEquipmentStateMachineWrapper
+public interface IEquipmentStateMachine
 {
-    /// <summary>Gets the equipment this state machine manages.</summary>
     Equipment Equipment { get; }
 
-    /// <summary>Checks if a trigger can be fired in the current state.</summary>
     bool CanFire(EquipmentTrigger trigger);
 
-    /// <summary>Fires a trigger, causing a state transition if valid.</summary>
     DomainResult Fire(EquipmentTrigger trigger);
 
-    /// <summary>Fires a parameterized trigger (e.g., Fault with reason).</summary>
+    /// <summary>Fires <see cref="EquipmentTrigger.Fault"/> with a recorded reason.</summary>
     DomainResult Fire(EquipmentTrigger trigger, string parameter);
 }

@@ -60,7 +60,7 @@ builder.Services.AddSingleton<ITelemetrySimulationController>(sp => sp.GetRequir
 builder.Services.AddSingleton<IHitlApprovalService, DemoHitlApprovalService>();
 
 // State machine factory (Stateless framework)
-builder.Services.AddSingleton<IEquipmentStateMachineFactory, EquipmentStateMachineFactoryImpl>();
+builder.Services.AddSingleton<IEquipmentStateMachineFactory, EquipmentStateMachineFactory>();
 
 builder.Services.AddSingleton<ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>, ChangeMachineStateCommandHandler>();
 builder.Services.AddSingleton<ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult>, RerouteWorkOrderCommandHandler>();

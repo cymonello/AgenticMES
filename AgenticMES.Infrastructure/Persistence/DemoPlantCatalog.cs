@@ -80,15 +80,28 @@ public sealed class DemoPlantCatalog
         Ensure(wo1005.ReportProduction(200m));
         Ensure(wo1005.Complete());
 
-        var cnc01 = new Equipment(Cnc01Id, "CNC-01", "Haas ST-20Y CNC Lathe", EquipmentLevel.Equipment, cncCell, WorkCenterCncId);
-        Ensure(cnc01.AssignWorkOrder(wo1001.Id));
-        Ensure(cnc01.Start(wo1001.Id));
+        var cnc01 = new Equipment(
+            Cnc01Id,
+            "CNC-01",
+            "Haas ST-20Y CNC Lathe",
+            EquipmentLevel.Equipment,
+            cncCell,
+            WorkCenterCncId,
+            EquipmentState.Running,
+            wo1001.Id);
 
         var cnc02 = new Equipment(Cnc02Id, "CNC-02", "Haas VF-2SS Vertical Mill", EquipmentLevel.Equipment, cncCell, WorkCenterCncId);
 
-        var cnc03 = new Equipment(Cnc03Id, "CNC-03", "Haas VF-3 Vertical Mill", EquipmentLevel.Equipment, cncCell, WorkCenterCncId);
-        Ensure(cnc03.AssignWorkOrder(wo1003.Id));
-        Ensure(cnc03.Fault("Spindle over-temperature trip"));
+        var cnc03 = new Equipment(
+            Cnc03Id,
+            "CNC-03",
+            "Haas VF-3 Vertical Mill",
+            EquipmentLevel.Equipment,
+            cncCell,
+            WorkCenterCncId,
+            EquipmentState.Faulted,
+            wo1003.Id,
+            "Spindle over-temperature trip");
 
         return new(
             [enterprise, site, area, workCenter, cnc01, cnc02, cnc03],

@@ -1,5 +1,4 @@
 using AgenticMES.Application.Common.Interfaces;
-using AgenticMES.Domain.Common;
 using AgenticMES.Domain.Entities;
 using AgenticMES.Domain.Enums;
 using Microsoft.Extensions.Logging;
@@ -92,7 +91,9 @@ public sealed class ChangeMachineStateCommandHandler(
             heldWorkOrder = holdResult.WorkOrder;
         }
 
-        var transition = ApplyTransition(stateMachine, command.TargetState, command.Reason);
+        var transition = trigger.Value is EquipmentTrigger.Fault
+            ? stateMachine.Fire(trigger.Value, command.Reason)
+            : stateMachine.Fire(trigger.Value);
         if (!transition.IsSuccess)
         {
             return ChangeMachineStateResult.Failure(transition.Error!, command.Reason, command.TriggeredBy);
@@ -142,42 +143,13 @@ public sealed class ChangeMachineStateCommandHandler(
             : (false, hold.Error, null);
     }
 
-    private static DomainResult ApplyTransition(IEquipmentStateMachineWrapper stateMachine, EquipmentState target, string reason)
-    {
-        var equipment = stateMachine.Equipment;
-        var trigger = MapStateToTrigger(equipment.State, target);
-        
-        if (trigger is null)
-        {
-            return DomainResult.Failure($"Unsupported equipment state '{target}'.");
-        }
-
-        // Handle work order assignment for Start trigger
-        if (trigger == EquipmentTrigger.Start && equipment.CurrentWorkOrderId is { } workOrderId)
-        {
-            var result = stateMachine.Fire(trigger.Value);
-            if (result.IsSuccess)
-            {
-                equipment.AssignWorkOrder(workOrderId);
-            }
-            return result;
-        }
-
-        // Handle parameterized Fault trigger
-        if (trigger == EquipmentTrigger.Fault)
-        {
-            return stateMachine.Fire(trigger.Value, reason);
-        }
-
-        return stateMachine.Fire(trigger.Value);
-    }
-
     private static EquipmentTrigger? MapStateToTrigger(EquipmentState currentState, EquipmentState targetState) =>
         (currentState, targetState) switch
         {
             (_, _) when currentState == targetState => null,
             (EquipmentState.Running, EquipmentState.Idle) => EquipmentTrigger.Stop,
             (_, EquipmentState.Idle) => EquipmentTrigger.Reset,
+            (EquipmentState.Setup, EquipmentState.Running) => EquipmentTrigger.CompleteSetup,
             (_, EquipmentState.Running) => EquipmentTrigger.Start,
             (_, EquipmentState.Faulted) => EquipmentTrigger.Fault,
             (_, EquipmentState.Maintenance) => EquipmentTrigger.EnterMaintenance,
