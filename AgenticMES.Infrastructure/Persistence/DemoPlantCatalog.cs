@@ -55,7 +55,7 @@ public sealed class DemoPlantCatalog
         var area = new Equipment(AreaMachiningId, "AREA-MACH", "Machining Area", EquipmentLevel.Area, machining, SiteKrakowId);
         var workCenter = new Equipment(WorkCenterCncId, "WC-CNC-01", "CNC Cell 1", EquipmentLevel.WorkCenter, cncCell, AreaMachiningId);
 
-        var wo1001 = new WorkOrder(Wo1001Id, "WO-1001", "SHAFT-A", 250m, now.AddHours(8), priority: 5);
+        var wo1001 = new WorkOrder(Wo1001Id, "WO-1001", "SHAFT-A", 600m, now.AddHours(8), priority: 5);
         Ensure(wo1001.Release());
         Ensure(wo1001.DispatchTo(Cnc01Id));
         Ensure(wo1001.Start());
