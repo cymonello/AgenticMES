@@ -299,13 +299,6 @@ public sealed class IncidentSimulationWorkflow(
                 ScrapMarkup(row.ScrapRate, row.IsAnomalous));
         }
 
-        var context = phase switch
-        {
-            DemoPhase.FloorBoard => "[grey]Talking point:[/] ISA-95 states + OEE = A × P × Q. CNC-01 running WO-1001 · CNC-02 idle · CNC-03 faulted.",
-            DemoPhase.Streaming => "[grey]Talking point:[/] mock OPC UA tags at 400 ms — temperature, coolant, vibration, spindle load, scrap.",
-            _ => "[grey]Talking point:[/] alarm inferred from the stream (temp / coolant / vibration) — next beat is the AI agent."
-        };
-
         var events = _eventLog.ToArray();
         var latest = events.Length == 0
             ? "[grey]Awaiting telemetry…[/]"
@@ -314,7 +307,6 @@ public sealed class IncidentSimulationWorkflow(
         return new FixedHeightRenderable(
             new Rows(
                 table,
-                new Markup(context),
                 new Markup(latest),
                 new Markup($"[bold aqua]▸ {Markup.Escape(prompt)}[/]")),
             height: LiveViewHeight);
@@ -349,7 +341,7 @@ public sealed class IncidentSimulationWorkflow(
             .BorderColor(Color.Red)
             .Padding(1, 0));
 
-        AnsiConsole.MarkupLine("\n[grey]Talking point:[/] next the MES AI agent diagnoses from the captured tag window, not a scripted narrative.\n");
+        AnsiConsole.WriteLine();
         await WaitUntilEnterAsync("Press [bold]Enter[/] to dispatch the AI agent", cancellationToken);
         await RunAiIncidentResponseAsync(cancellationToken);
     }
@@ -592,8 +584,6 @@ public sealed class IncidentSimulationWorkflow(
             }
             AnsiConsole.WriteLine();
         }
-
-        AnsiConsole.MarkupLine("[grey]Talking point:[/] Final shop floor state shows the results of AI agent decisions and operator approvals.\n");
     }
 
     private async Task<AnomalyContext?> BuildAnomalyContextAsync(CancellationToken cancellationToken)
@@ -917,14 +907,14 @@ public sealed class IncidentSimulationWorkflow(
 
         var anomalous = _incidentCapture.AnomalousEquipmentId == readout.EquipmentId;
         var tone = anomalous ? "red" : "grey70";
-        var quality = readout.Quality is TelemetryQuality.Good ? string.Empty : $" [{readout.Quality}]";
-        var unit = string.IsNullOrWhiteSpace(readout.EngineeringUnit) ? string.Empty : $" {readout.EngineeringUnit}";
-        EnqueueEvent($"[{tone}]{readout.Timestamp:HH:mm:ss}[/] {code} {readout.TagName}={readout.Value}{unit}{quality}");
+        var quality = readout.Quality is TelemetryQuality.Good ? string.Empty : $" ({readout.Quality})";
+        var unit = string.IsNullOrWhiteSpace(readout.EngineeringUnit) ? string.Empty : $" {Markup.Escape(readout.EngineeringUnit)}";
+        EnqueueEvent($"[{tone}]{readout.Timestamp:HH:mm:ss}[/] {Markup.Escape(code)} {Markup.Escape(readout.TagName)}={readout.Value:0.00}{unit}{Markup.Escape(quality)}");
 
         if (justDetected)
         {
             EnqueueEvent(
-                $"[bold red]DETECTED[/]  {code} {readout.TagName}={readout.Value}{unit} crossed alarm — capturing window");
+                $"[bold red]DETECTED[/]  {Markup.Escape(code)} {Markup.Escape(readout.TagName)}={readout.Value:0.00}{unit} crossed alarm — capturing window");
         }
     }
 
