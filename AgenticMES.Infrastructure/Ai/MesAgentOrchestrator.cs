@@ -1,4 +1,3 @@
-using AgenticMES.Application.AiTools;
 using AgenticMES.Domain.Events;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
@@ -20,15 +19,15 @@ public sealed class MesAgentOrchestrator
     public MesAgentOrchestrator(
         string openAiApiKey,
         string openAiModelId,
-        MachineControlTools machineControlTools,
-        SchedulingTools schedulingTools,
+        MachineControlPlugin machineControlPlugin,
+        SchedulingPlugin schedulingPlugin,
         ManualsKnowledgeBase knowledgeBase,
         ILogger<MesAgentOrchestrator> logger)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(openAiApiKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(openAiModelId);
-        ArgumentNullException.ThrowIfNull(machineControlTools);
-        ArgumentNullException.ThrowIfNull(schedulingTools);
+        ArgumentNullException.ThrowIfNull(machineControlPlugin);
+        ArgumentNullException.ThrowIfNull(schedulingPlugin);
         ArgumentNullException.ThrowIfNull(knowledgeBase);
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -42,8 +41,8 @@ public sealed class MesAgentOrchestrator
             apiKey: openAiApiKey);
 
         // Register MES toolset for autonomous function calling
-        builder.Plugins.AddFromObject(machineControlTools, "MachineControl");
-        builder.Plugins.AddFromObject(schedulingTools, "Scheduling");
+        builder.Plugins.AddFromObject(machineControlPlugin, "MachineControl");
+        builder.Plugins.AddFromObject(schedulingPlugin, "Scheduling");
 
         _kernel = builder.Build();
 

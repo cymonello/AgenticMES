@@ -1,5 +1,4 @@
-﻿using AgenticMES.Application.AiTools;
-using AgenticMES.Application.Common.Interfaces;
+﻿using AgenticMES.Application.Common.Interfaces;
 using AgenticMES.Application.CQRS;
 using AgenticMES.Application.CQRS.Commands;
 using AgenticMES.Application.Services;
@@ -60,8 +59,14 @@ builder.Services.AddSingleton<ITelemetrySimulationController>(sp => sp.GetRequir
 builder.Services.AddSingleton<IHitlApprovalService, DemoHitlApprovalService>();
 builder.Services.AddSingleton<ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>, ChangeMachineStateCommandHandler>();
 builder.Services.AddSingleton<ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult>, RerouteWorkOrderCommandHandler>();
-builder.Services.AddSingleton<MachineControlTools>();
-builder.Services.AddSingleton<SchedulingTools>();
+
+// Application services (framework-agnostic)
+builder.Services.AddSingleton<IMachineControlService, MachineControlService>();
+builder.Services.AddSingleton<ISchedulingService, SchedulingService>();
+
+// Infrastructure AI components (SK-specific)
+builder.Services.AddSingleton<MachineControlPlugin>();
+builder.Services.AddSingleton<SchedulingPlugin>();
 builder.Services.AddSingleton<ManualsKnowledgeBase>();
 
 builder.Services.AddSingleton<MesAgentOrchestrator>(sp =>
@@ -83,8 +88,8 @@ builder.Services.AddSingleton<MesAgentOrchestrator>(sp =>
     return new MesAgentOrchestrator(
         apiKey,
         modelId,
-        sp.GetRequiredService<MachineControlTools>(),
-        sp.GetRequiredService<SchedulingTools>(),
+        sp.GetRequiredService<MachineControlPlugin>(),
+        sp.GetRequiredService<SchedulingPlugin>(),
         sp.GetRequiredService<ManualsKnowledgeBase>(),
         sp.GetRequiredService<ILogger<MesAgentOrchestrator>>());
 });
@@ -147,7 +152,7 @@ static bool ShouldCaptureInDemoUi(string? category, LogLevel level)
         return level >= LogLevel.Information;
     }
 
-    if (category.StartsWith("AgenticMES.Application.AiTools", StringComparison.Ordinal))
+    if (category.StartsWith("AgenticMES.Application.Services", StringComparison.Ordinal))
     {
         return level >= LogLevel.Information;
     }
