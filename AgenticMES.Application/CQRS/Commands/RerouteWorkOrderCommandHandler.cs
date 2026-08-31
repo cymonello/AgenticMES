@@ -9,6 +9,7 @@ public sealed class RerouteWorkOrderCommandHandler(
     IEquipmentRepository equipmentRepository,
     IWorkOrderRepository workOrderRepository,
     IHitlApprovalService hitlApprovalService,
+    IEquipmentStateMachineFactory stateMachineFactory,
     ILogger<RerouteWorkOrderCommandHandler> logger)
     : ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult>
 {
@@ -115,8 +116,9 @@ public sealed class RerouteWorkOrderCommandHandler(
             }
         }
 
+        var sourceStateMachine = stateMachineFactory.Create(source);
         var releaseSource = source.State is EquipmentState.Running
-            ? source.Stop()
+            ? sourceStateMachine.Fire(EquipmentTrigger.Stop)
             : source.ClearWorkOrderAssignment();
 
         if (!releaseSource.IsSuccess)

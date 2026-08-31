@@ -1,5 +1,4 @@
 using AgenticMES.Application.Common.Interfaces;
-using AgenticMES.Domain.Common;
 using AgenticMES.Domain.Entities;
 using AgenticMES.Domain.Enums;
 using Microsoft.Extensions.Logging;
@@ -10,6 +9,7 @@ public sealed class ChangeMachineStateCommandHandler(
     IEquipmentRepository equipmentRepository,
     IWorkOrderRepository workOrderRepository,
     IHitlApprovalService hitlApprovalService,
+    IEquipmentStateMachineFactory stateMachineFactory,
     ILogger<ChangeMachineStateCommandHandler> logger)
     : ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>
 {
@@ -66,7 +66,10 @@ public sealed class ChangeMachineStateCommandHandler(
                 command.TriggeredBy);
         }
 
-        if (!equipment.CanTransitionTo(command.TargetState))
+        var stateMachine = stateMachineFactory.Create(equipment);
+        var trigger = MapStateToTrigger(equipment.State, command.TargetState);
+        
+        if (trigger is null || !stateMachine.CanFire(trigger.Value))
         {
             return ChangeMachineStateResult.Failure(
                 $"Illegal ISA-95 equipment transition: {equipment.State} → {command.TargetState} on {equipment.EquipmentCode}.",
@@ -88,7 +91,9 @@ public sealed class ChangeMachineStateCommandHandler(
             heldWorkOrder = holdResult.WorkOrder;
         }
 
-        var transition = ApplyTransition(equipment, command.TargetState, command.Reason);
+        var transition = trigger.Value is EquipmentTrigger.Fault
+            ? stateMachine.Fire(trigger.Value, command.Reason)
+            : stateMachine.Fire(trigger.Value);
         if (!transition.IsSuccess)
         {
             return ChangeMachineStateResult.Failure(transition.Error!, command.Reason, command.TriggeredBy);
@@ -138,16 +143,18 @@ public sealed class ChangeMachineStateCommandHandler(
             : (false, hold.Error, null);
     }
 
-    private static DomainResult ApplyTransition(Equipment equipment, EquipmentState target, string reason) =>
-        target switch
+    private static EquipmentTrigger? MapStateToTrigger(EquipmentState currentState, EquipmentState targetState) =>
+        (currentState, targetState) switch
         {
-            EquipmentState.Idle when equipment.State is EquipmentState.Running => equipment.Stop(),
-            EquipmentState.Idle => equipment.Reset(),
-            EquipmentState.Running => equipment.Start(equipment.CurrentWorkOrderId),
-            EquipmentState.Faulted => equipment.Fault(reason),
-            EquipmentState.Maintenance => equipment.EnterMaintenance(),
-            EquipmentState.Setup => equipment.EnterSetup(),
-            _ => DomainResult.Failure($"Unsupported equipment state '{target}'.")
+            (_, _) when currentState == targetState => null,
+            (EquipmentState.Running, EquipmentState.Idle) => EquipmentTrigger.Stop,
+            (_, EquipmentState.Idle) => EquipmentTrigger.Reset,
+            (EquipmentState.Setup, EquipmentState.Running) => EquipmentTrigger.CompleteSetup,
+            (_, EquipmentState.Running) => EquipmentTrigger.Start,
+            (_, EquipmentState.Faulted) => EquipmentTrigger.Fault,
+            (_, EquipmentState.Maintenance) => EquipmentTrigger.EnterMaintenance,
+            (_, EquipmentState.Setup) => EquipmentTrigger.EnterSetup,
+            _ => null
         };
 
     /// <summary>Stopping, faulting, or locking out a machine is a high-risk plant-floor action.</summary>

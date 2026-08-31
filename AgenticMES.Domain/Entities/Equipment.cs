@@ -5,7 +5,8 @@ using AgenticMES.Domain.ValueObjects;
 namespace AgenticMES.Domain.Entities;
 
 /// <summary>
-/// ISA-95 Equipment (physical asset / machine) with an industrial state machine.
+/// ISA-95 Equipment (physical asset / machine). Industrial transitions are owned by the
+/// Infrastructure state machine; this entity only stores state and assignment side effects.
 /// </summary>
 public sealed class Equipment(
     Guid id,
@@ -15,7 +16,8 @@ public sealed class Equipment(
     EquipmentHierarchy hierarchy,
     Guid? parentEquipmentId = null,
     EquipmentState state = EquipmentState.Idle,
-    Guid? currentWorkOrderId = null)
+    Guid? currentWorkOrderId = null,
+    string? lastFaultReason = null)
 {
     public Guid Id { get; } = id;
 
@@ -34,71 +36,36 @@ public sealed class Equipment(
 
     public Guid? CurrentWorkOrderId { get; private set; } = currentWorkOrderId;
 
-    public string? LastFaultReason { get; private set; }
+    public string? LastFaultReason { get; private set; } =
+        state is EquipmentState.Faulted ? lastFaultReason?.Trim() : null;
 
     public DateTimeOffset StateChangedAt { get; private set; } = DateTimeOffset.UtcNow;
 
-    public bool CanTransitionTo(EquipmentState target) => (State, target) switch
+    /// <summary>
+    /// Applies a state already accepted by the equipment state machine.
+    /// Does not re-validate ISA-95 transitions.
+    /// </summary>
+    public void ApplyState(EquipmentState target, string? faultReason = null)
     {
-        (_, _) when State == target => false,
-        (EquipmentState.Idle, EquipmentState.Running or EquipmentState.Setup or EquipmentState.Maintenance or EquipmentState.Faulted) => true,
-        (EquipmentState.Running, EquipmentState.Idle or EquipmentState.Faulted or EquipmentState.Maintenance or EquipmentState.Setup) => true,
-        (EquipmentState.Faulted, EquipmentState.Idle or EquipmentState.Maintenance) => true,
-        (EquipmentState.Maintenance, EquipmentState.Idle) => true,
-        (EquipmentState.Setup, EquipmentState.Idle or EquipmentState.Running or EquipmentState.Faulted) => true,
-        _ => false
-    };
+        State = target;
+        StateChangedAt = DateTimeOffset.UtcNow;
 
-    public DomainResult Start(Guid? workOrderId = null)
-    {
-        var result = TryTransitionTo(EquipmentState.Running);
-        if (result.IsSuccess && workOrderId is not null)
+        if (target is EquipmentState.Faulted)
         {
-            CurrentWorkOrderId = workOrderId;
+            if (!string.IsNullOrWhiteSpace(faultReason))
+            {
+                LastFaultReason = faultReason.Trim();
+            }
         }
-
-        return result;
-    }
-
-    public DomainResult Stop()
-    {
-        var result = TryTransitionTo(EquipmentState.Idle);
-        if (result.IsSuccess)
-        {
-            CurrentWorkOrderId = null;
-            LastFaultReason = null;
-        }
-
-        return result;
-    }
-
-    public DomainResult Fault(string reason)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
-
-        var result = TryTransitionTo(EquipmentState.Faulted);
-        if (result.IsSuccess)
-        {
-            LastFaultReason = reason.Trim();
-        }
-
-        return result;
-    }
-
-    public DomainResult EnterSetup() => TryTransitionTo(EquipmentState.Setup);
-
-    public DomainResult EnterMaintenance() => TryTransitionTo(EquipmentState.Maintenance);
-
-    public DomainResult Reset()
-    {
-        var result = TryTransitionTo(EquipmentState.Idle);
-        if (result.IsSuccess)
+        else
         {
             LastFaultReason = null;
-            CurrentWorkOrderId = null;
         }
 
-        return result;
+        if (target is EquipmentState.Idle)
+        {
+            CurrentWorkOrderId = null;
+        }
     }
 
     public DomainResult AssignWorkOrder(Guid workOrderId)
@@ -119,23 +86,6 @@ public sealed class Equipment(
     public DomainResult ClearWorkOrderAssignment()
     {
         CurrentWorkOrderId = null;
-        return DomainResult.Success();
-    }
-
-    public DomainResult TryTransitionTo(EquipmentState target)
-    {
-        if (!CanTransitionTo(target))
-        {
-            return DomainResult.Failure($"Illegal ISA-95 equipment transition: {State} → {target} on {EquipmentCode}.");
-        }
-
-        State = target;
-        StateChangedAt = DateTimeOffset.UtcNow;
-        if (target is not EquipmentState.Faulted)
-        {
-            LastFaultReason = null;
-        }
-
         return DomainResult.Success();
     }
 
