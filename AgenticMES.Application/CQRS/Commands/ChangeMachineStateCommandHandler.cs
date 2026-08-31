@@ -10,6 +10,7 @@ public sealed class ChangeMachineStateCommandHandler(
     IEquipmentRepository equipmentRepository,
     IWorkOrderRepository workOrderRepository,
     IHitlApprovalService hitlApprovalService,
+    IEquipmentStateMachineFactory stateMachineFactory,
     ILogger<ChangeMachineStateCommandHandler> logger)
     : ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>
 {
@@ -66,7 +67,10 @@ public sealed class ChangeMachineStateCommandHandler(
                 command.TriggeredBy);
         }
 
-        if (!equipment.CanTransitionTo(command.TargetState))
+        var stateMachine = stateMachineFactory.Create(equipment);
+        var trigger = MapStateToTrigger(equipment.State, command.TargetState);
+        
+        if (trigger is null || !stateMachine.CanFire(trigger.Value))
         {
             return ChangeMachineStateResult.Failure(
                 $"Illegal ISA-95 equipment transition: {equipment.State} → {command.TargetState} on {equipment.EquipmentCode}.",
@@ -88,7 +92,7 @@ public sealed class ChangeMachineStateCommandHandler(
             heldWorkOrder = holdResult.WorkOrder;
         }
 
-        var transition = ApplyTransition(equipment, command.TargetState, command.Reason);
+        var transition = ApplyTransition(stateMachine, command.TargetState, command.Reason);
         if (!transition.IsSuccess)
         {
             return ChangeMachineStateResult.Failure(transition.Error!, command.Reason, command.TriggeredBy);
@@ -138,16 +142,47 @@ public sealed class ChangeMachineStateCommandHandler(
             : (false, hold.Error, null);
     }
 
-    private static DomainResult ApplyTransition(Equipment equipment, EquipmentState target, string reason) =>
-        target switch
+    private static DomainResult ApplyTransition(IEquipmentStateMachineWrapper stateMachine, EquipmentState target, string reason)
+    {
+        var equipment = stateMachine.Equipment;
+        var trigger = MapStateToTrigger(equipment.State, target);
+        
+        if (trigger is null)
         {
-            EquipmentState.Idle when equipment.State is EquipmentState.Running => equipment.Stop(),
-            EquipmentState.Idle => equipment.Reset(),
-            EquipmentState.Running => equipment.Start(equipment.CurrentWorkOrderId),
-            EquipmentState.Faulted => equipment.Fault(reason),
-            EquipmentState.Maintenance => equipment.EnterMaintenance(),
-            EquipmentState.Setup => equipment.EnterSetup(),
-            _ => DomainResult.Failure($"Unsupported equipment state '{target}'.")
+            return DomainResult.Failure($"Unsupported equipment state '{target}'.");
+        }
+
+        // Handle work order assignment for Start trigger
+        if (trigger == EquipmentTrigger.Start && equipment.CurrentWorkOrderId is { } workOrderId)
+        {
+            var result = stateMachine.Fire(trigger.Value);
+            if (result.IsSuccess)
+            {
+                equipment.AssignWorkOrder(workOrderId);
+            }
+            return result;
+        }
+
+        // Handle parameterized Fault trigger
+        if (trigger == EquipmentTrigger.Fault)
+        {
+            return stateMachine.Fire(trigger.Value, reason);
+        }
+
+        return stateMachine.Fire(trigger.Value);
+    }
+
+    private static EquipmentTrigger? MapStateToTrigger(EquipmentState currentState, EquipmentState targetState) =>
+        (currentState, targetState) switch
+        {
+            (_, _) when currentState == targetState => null,
+            (EquipmentState.Running, EquipmentState.Idle) => EquipmentTrigger.Stop,
+            (_, EquipmentState.Idle) => EquipmentTrigger.Reset,
+            (_, EquipmentState.Running) => EquipmentTrigger.Start,
+            (_, EquipmentState.Faulted) => EquipmentTrigger.Fault,
+            (_, EquipmentState.Maintenance) => EquipmentTrigger.EnterMaintenance,
+            (_, EquipmentState.Setup) => EquipmentTrigger.EnterSetup,
+            _ => null
         };
 
     /// <summary>Stopping, faulting, or locking out a machine is a high-risk plant-floor action.</summary>

@@ -7,6 +7,7 @@ using AgenticMES.Infrastructure.Ai;
 using AgenticMES.Infrastructure.Persistence;
 using AgenticMES.Infrastructure.Services;
 using AgenticMES.Infrastructure.Simulation;
+using AgenticMES.Infrastructure.StateMachine;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -57,6 +58,10 @@ builder.Services.AddSingleton<ITelemetryStreamer>(sp => sp.GetRequiredService<Si
 builder.Services.AddSingleton<ITelemetrySimulationController>(sp => sp.GetRequiredService<SimulatedTelemetryStreamer>());
 
 builder.Services.AddSingleton<IHitlApprovalService, DemoHitlApprovalService>();
+
+// State machine factory (Stateless framework)
+builder.Services.AddSingleton<IEquipmentStateMachineFactory, EquipmentStateMachineFactoryImpl>();
+
 builder.Services.AddSingleton<ICommandHandler<ChangeMachineStateCommand, ChangeMachineStateResult>, ChangeMachineStateCommandHandler>();
 builder.Services.AddSingleton<ICommandHandler<RerouteWorkOrderCommand, RerouteWorkOrderResult>, RerouteWorkOrderCommandHandler>();
 

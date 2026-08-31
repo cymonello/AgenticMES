@@ -38,6 +38,10 @@ public sealed class Equipment(
 
     public DateTimeOffset StateChangedAt { get; private set; } = DateTimeOffset.UtcNow;
 
+    /// <summary>
+    /// Checks if a specific trigger can be fired in the current state.
+    /// Used by external state machine implementations (e.g., Stateless framework in Infrastructure).
+    /// </summary>
     public bool CanTransitionTo(EquipmentState target) => (State, target) switch
     {
         (_, _) when State == target => false,
