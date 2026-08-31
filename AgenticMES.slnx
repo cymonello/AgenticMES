@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="AgenticMES.Application.Tests/AgenticMES.Application.Tests.csproj" />
   <Project Path="AgenticMES.Application/AgenticMES.Application.csproj" />
   <Project Path="AgenticMES.ConsoleApp/AgenticMES.ConsoleApp.csproj" />
   <Project Path="AgenticMES.Domain/AgenticMES.Domain.csproj" />
